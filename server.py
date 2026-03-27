@@ -8,8 +8,9 @@ import logging
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
+from starlette.middleware.base import BaseHTTPMiddleware
 from mcp.server.fastmcp import FastMCP
 from huggingface_hub import (
     HfApi,
@@ -32,7 +33,6 @@ log = logging.getLogger("hf-mcp")
 
 api = HfApi(token=HF_TOKEN or None)
 
-# stateless_http=True => each request is independent, no session needed
 mcp = FastMCP(
     "hf-mcp-server",
     stateless_http=True,
@@ -76,11 +76,7 @@ def hf_repository_manager(
     description: str = "",
     space_sdk: str = "",
 ) -> dict:
-    """
-    Manage HF repositories.
-    action: create | delete | info | list_files
-    repo_type: model | dataset | space
-    """
+    """Manage HF repositories. action: create | delete | info | list_files"""
     if action == "info":
         r = safe_run(api.repo_info, repo_id=repo_id, repo_type=repo_type)
         return r if isinstance(r, dict) else r.__dict__
@@ -116,10 +112,7 @@ def hf_file_operations(
     replacement: str = "",
     file_patterns: list = None,
 ) -> dict:
-    """
-    CRUD on HF repo files.
-    action: read | write | edit | delete | validate | backup | batch_edit
-    """
+    """CRUD on HF repo files. action: read | write | edit | delete | validate | backup | batch_edit"""
     if file_patterns is None:
         file_patterns = ["*.md"]
     if action == "read":
@@ -205,13 +198,7 @@ def hf_file_operations(
 
 
 @mcp.tool()
-def hf_search_hub(
-    content_type: str,
-    query: str = "",
-    author: str = "",
-    filter_tag: str = "",
-    limit: int = 20,
-) -> dict:
+def hf_search_hub(content_type: str, query: str = "", author: str = "", filter_tag: str = "", limit: int = 20) -> dict:
     """Search HF Hub. content_type: models | datasets | spaces"""
     try:
         kw = dict(search=query or None, author=author or None, filter=filter_tag or None, limit=limit)
@@ -231,117 +218,7 @@ def hf_search_hub(
 
 
 @mcp.tool()
-def hf_collections(
-    action: str,
-    title: str = "",
-    namespace: str = "",
-    description: str = "",
-    private: bool = False,
-    collection_slug: str = "",
-    item_id: str = "",
-    item_type: str = "model",
-    note: str = "",
-) -> dict:
-    """Manage HF Collections. action: create | add_item | info"""
-    if action == "create":
-        read_only_guard()
-        r = safe_run(api.create_collection, title=title, namespace=namespace or None,
-                     description=description, private=private, exists_ok=True)
-        return {"slug": getattr(r, "slug", str(r))}
-    if action == "add_item":
-        read_only_guard()
-        r = safe_run(api.add_collection_item, collection_slug=collection_slug, item_id=item_id,
-                     item_type=item_type, note=note, exists_ok=True)
-        return {"added": str(r)}
-    if action == "info":
-        r = safe_run(api.get_collection, collection_slug=collection_slug)
-        return r if isinstance(r, dict) else r.__dict__
-    return {"error": f"Unknown action: {action}"}
-
-
-@mcp.tool()
-def hf_pull_requests(
-    action: str,
-    repo_id: str,
-    repo_type: str = "model",
-    title: str = "",
-    description: str = "",
-    status: str = "open",
-    author: str = "",
-    pr_number: int = 0,
-    files: list = None,
-    commit_message: str = "",
-    pr_title: str = "",
-    pr_description: str = "",
-) -> dict:
-    """Manage HF Pull Requests. action: create | list | details | create_with_files"""
-    files = files or []
-    if action == "create":
-        read_only_guard()
-        r = safe_run(api.create_discussion, repo_id=repo_id, repo_type=repo_type,
-                     title=title or "New PR", description=description, pull_request=True)
-        return {"pr": str(r)}
-    if action == "list":
-        discussions = safe_run(api.get_repo_discussions, repo_id=repo_id, repo_type=repo_type)
-        if isinstance(discussions, dict):
-            return discussions
-        prs = [{"num": d.num, "title": d.title, "status": d.status, "author": d.author}
-               for d in discussions
-               if getattr(d, "is_pull_request", False)
-               and (status == "all" or getattr(d, "status", None) == status)
-               and (not author or getattr(d, "author", None) == author)]
-        return {"pull_requests": prs}
-    if action == "details":
-        r = safe_run(api.get_discussion_details, repo_id=repo_id, repo_type=repo_type, discussion_num=pr_number)
-        return r if isinstance(r, dict) else r.__dict__
-    if action == "create_with_files":
-        read_only_guard()
-        ops = [CommitOperationAdd(path_in_repo=f["path"], path_or_fileobj=f["content"].encode()) for f in files]
-        r = safe_run(api.create_commit, repo_id=repo_id, repo_type=repo_type, operations=ops,
-                     commit_message=commit_message or "Update files", create_pr=True, pr_description=pr_description)
-        return {"pr": str(r), "title": pr_title}
-    return {"error": f"Unknown action: {action}"}
-
-
-@mcp.tool()
-def hf_upload_manager(
-    action: str,
-    repo_id: str,
-    repo_type: str = "model",
-    file_path: str = "",
-    content: str = "",
-    commit_message: str = "",
-    files: list = None,
-    pr_title: str = "",
-    pr_description: str = "",
-) -> dict:
-    """Upload files to HF. action: single_file | multiple_files | with_pr"""
-    files = files or []
-    read_only_guard()
-    if action == "single_file":
-        r = safe_run(api.upload_file, path_or_fileobj=content.encode(), path_in_repo=file_path,
-                     repo_id=repo_id, repo_type=repo_type, commit_message=commit_message or f"Upload {file_path}")
-        return {"uploaded": str(r)}
-    if action == "multiple_files":
-        ops = [CommitOperationAdd(path_in_repo=f["path"], path_or_fileobj=f["content"].encode()) for f in files]
-        r = safe_run(api.create_commit, repo_id=repo_id, repo_type=repo_type, operations=ops,
-                     commit_message=commit_message or "Upload multiple files")
-        return {"commit": str(r)}
-    if action == "with_pr":
-        ops = [CommitOperationAdd(path_in_repo=file_path, path_or_fileobj=content.encode())]
-        r = safe_run(api.create_commit, repo_id=repo_id, repo_type=repo_type, operations=ops,
-                     commit_message=commit_message or f"Upload {file_path}", create_pr=True, pr_description=pr_description)
-        return {"pr": str(r), "title": pr_title}
-    return {"error": f"Unknown action: {action}"}
-
-
-@mcp.tool()
-def hf_space_management(
-    action: str,
-    space_id: str,
-    to_id: str = "",
-    sleep_time: int = 300,
-) -> dict:
+def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time: int = 300) -> dict:
     """Manage HF Spaces. action: runtime_info | restart | pause | set_sleep_time | duplicate"""
     if action == "runtime_info":
         r = safe_run(api.get_space_runtime, repo_id=space_id)
@@ -362,22 +239,13 @@ def hf_space_management(
 
 
 @mcp.tool()
-def hf_community_features(
-    action: str,
-    repo_id: str = "",
-    repo_type: str = "model",
-    title: str = "",
-    description: str = "",
-) -> dict:
+def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
+                          title: str = "", description: str = "") -> dict:
     """Community features. action: like | unlike | get_likes | create_discussion | get_commits | get_refs"""
     if action == "like":
-        read_only_guard()
-        safe_run(api.like, repo_id=repo_id, repo_type=repo_type)
-        return {"liked": repo_id}
+        read_only_guard(); safe_run(api.like, repo_id=repo_id, repo_type=repo_type); return {"liked": repo_id}
     if action == "unlike":
-        read_only_guard()
-        safe_run(api.unlike, repo_id=repo_id, repo_type=repo_type)
-        return {"unliked": repo_id}
+        read_only_guard(); safe_run(api.unlike, repo_id=repo_id, repo_type=repo_type); return {"unliked": repo_id}
     if action == "get_likes":
         r = safe_run(api.list_liked_repos)
         return {"liked_repos": [str(x) for x in (r or [])]}
@@ -388,8 +256,7 @@ def hf_community_features(
         return {"discussion": str(r)}
     if action == "get_commits":
         r = safe_run(api.list_repo_commits, repo_id=repo_id, repo_type=repo_type)
-        if isinstance(r, dict):
-            return r
+        if isinstance(r, dict): return r
         return {"commits": [{"id": c.commit_id, "message": c.title} for c in list(r)[:50]]}
     if action == "get_refs":
         r = safe_run(api.list_repo_refs, repo_id=repo_id, repo_type=repo_type)
@@ -398,57 +265,13 @@ def hf_community_features(
 
 
 @mcp.tool()
-def hf_inference_tools(
-    action: str,
-    repo_id: str,
-    inputs: list = None,
-    parameters: dict = None,
-) -> dict:
-    """Test model inference. action: check_endpoints | test_inference"""
-    inputs = inputs or ["Hello"]
-    parameters = parameters or {}
-    if action == "check_endpoints":
-        info = safe_run(api.repo_info, repo_id=repo_id, repo_type="model")
-        if isinstance(info, dict):
-            return info
-        return {"repo_id": repo_id, "pipeline_tag": getattr(info, "pipeline_tag", None),
-                "library_name": getattr(info, "library_name", None), "tags": getattr(info, "tags", [])}
-    if action == "test_inference":
-        try:
-            client = InferenceClient(model=repo_id, token=HF_TOKEN or None, timeout=HF_INFERENCE_TIMEOUT)
-            results = []
-            for inp in inputs:
-                try:
-                    out = client.text_generation(inp, **parameters)
-                    results.append({"input": inp, "output": str(out)})
-                except Exception as e:
-                    results.append({"input": inp, "error": str(e)})
-            return {"inference_results": results}
-        except Exception as e:
-            return {"error": str(e)}
-    return {"error": f"Unknown action: {action}"}
-
-
-@mcp.tool()
 def hf_repo_file_manager(
-    action: str,
-    repo_id: str,
-    repo_type: str = "model",
-    filename: str = "",
-    new_filename: str = "",
-    content: str = "",
-    old_text: str = "",
-    new_text: str = "",
-    commit_message: str = "",
-    private: bool = False,
-    description: str = "",
-    space_sdk: str = "",
+    action: str, repo_id: str, repo_type: str = "model",
+    filename: str = "", new_filename: str = "", content: str = "",
+    old_text: str = "", new_text: str = "", commit_message: str = "",
+    private: bool = False, description: str = "", space_sdk: str = "",
 ) -> dict:
-    """
-    Unified repo + file manager.
-    action: repo_create | repo_delete | repo_info | list_files |
-            file_read | file_write | file_edit | file_delete | file_rename
-    """
+    """Unified repo+file manager. action: repo_create|repo_delete|repo_info|list_files|file_read|file_write|file_edit|file_delete|file_rename"""
     if action == "repo_create":
         return hf_repository_manager("create", repo_id, repo_type, private, description, space_sdk)
     if action == "repo_delete":
@@ -486,42 +309,34 @@ async def health(request: Request):
     return JSONResponse({"status": "ok", "version": "3.1.0"})
 
 
-# Build the MCP ASGI sub-app once
-_mcp_app = mcp.streamable_http_app()
+# Build MCP ASGI sub-app — streamable HTTP handler lives at its own root
+_mcp_asgi = mcp.streamable_http_app()
 
 
-# Wrap in a custom lifespan that boots the MCP session manager
 @contextlib.asynccontextmanager
 async def lifespan(app):
     async with mcp.session_manager.run():
         yield
 
 
-# KEY FIX:
-#  - Mount at "/mcp" strips the prefix, so the inner app sees "/"
-#  - Route("/health") must come BEFORE the Mount so it takes priority
-#  - GET /mcp  -> 307 -> GET /mcp/  was 404 because inner app had no GET /
-#    => use mcp.http_app() path="/mcp" OR mount at "/mcp" and ensure
-#       trailing-slash requests hit the POST handler inside the sub-app
+# STRATEGY: run TWO separate Starlette apps:
+#   - main app handles /health
+#   - MCP sub-app mounted at /mcp via Mount
 #
-# stateless_http=True means inner router handles POST / (root of sub-app)
-# Starlette Mount strips "/mcp" prefix before passing to sub-app, so
-# POST /mcp  => inner app sees POST /  ✔
-# POST /mcp/ => inner app sees POST /  ✔  (Starlette normalises)
+# Mount("/mcp") strips the /mcp prefix and passes the rest to _mcp_asgi
+# So POST /mcp  -> _mcp_asgi sees POST /
+#    POST /mcp/ -> _mcp_asgi sees POST /
 #
-# The 307 redirect loop happened because GET /mcp was being redirected to
-# GET /mcp/ by Starlette's redirect_slashes=True (default). We disable it.
+# redirect_slashes=False prevents 307 GET /mcp -> GET /mcp/ loops
 app = Starlette(
     lifespan=lifespan,
     routes=[
-        Route("/health", health, methods=["GET"]),
-        Route("/health/", health, methods=["GET"]),
-        Mount("/mcp", app=_mcp_app),
+        Route("/health", health, methods=["GET", "HEAD"]),
+        Route("/health/", health, methods=["GET", "HEAD"]),
+        # Mount strips /mcp prefix before forwarding
+        Mount("/mcp", app=_mcp_asgi),
     ],
-    # Disable automatic slash redirects to prevent 307 -> 404 loops
-    # on GET /mcp -> GET /mcp/
 )
-# Monkey-patch: turn off redirect_slashes so GET /mcp doesn't 307
 app.router.redirect_slashes = False
 
 
