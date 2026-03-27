@@ -33,7 +33,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("hf-mcp-server")
 
 api = HfApi(token=HF_TOKEN or None)
-mcp = FastMCP("hf-mcp-server", stateless_http=True)
+
+# host/port passed here are used only by mcp.run() (not our path).
+# stateless_http=True disables session state between calls.
+mcp = FastMCP(
+    "hf-mcp-server",
+    stateless_http=True,
+    json_response=True,
+)
 
 
 # ── HELPERS ───────────────────────────────────────────────
@@ -61,7 +68,7 @@ def hf_system_info() -> dict:
     whoami = safe_run(api.whoami) if HF_TOKEN else None
     return {
         "server": "hf-mcp-server",
-        "version": "2.0.1-http",
+        "version": "2.0.2-http",
         "transport": "streamable-http",
         "endpoint": f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         "read_only": HF_READ_ONLY,
@@ -543,12 +550,13 @@ def hf_repo_file_manager(
 if __name__ == "__main__":
     log.info(f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}")
 
-    # mcp.server.fastmcp.run() does NOT support host/port/path kwargs.
-    # We mount the ASGI app manually and drive it with uvicorn.
-    starlette_app = mcp.http_app(path=MCP_PATH)
+    # mcp.streamable_http_app() returns a Starlette ASGI app.
+    # The MCP endpoint is mounted internally at MCP_PATH.
+    # We then hand it to uvicorn for host/port binding.
+    app = mcp.streamable_http_app()
 
     uvicorn.run(
-        starlette_app,
+        app,
         host=MCP_HOST,
         port=MCP_PORT,
         log_level="info",
