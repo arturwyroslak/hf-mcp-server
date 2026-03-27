@@ -7,7 +7,9 @@ Endpoint: http://0.0.0.0:8000/mcp
 import os
 import json
 import fnmatch
+import logging
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from huggingface_hub import (
     HfApi,
@@ -17,19 +19,24 @@ from huggingface_hub import (
     CommitOperationDelete,
 )
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-HF_READ_ONLY = os.environ.get("HF_READ_ONLY", "false").lower() == "true"
-HF_ADMIN_MODE = os.environ.get("HF_ADMIN_MODE", "false").lower() == "true"
-HF_MAX_FILE_SIZE = int(os.environ.get("HF_MAX_FILE_SIZE", str(100 * 1024 * 1024)))
+# ── CONFIG ────────────────────────────────────────────────
+HF_TOKEN             = os.environ.get("HF_TOKEN", "")
+HF_READ_ONLY         = os.environ.get("HF_READ_ONLY", "false").lower() == "true"
+HF_ADMIN_MODE        = os.environ.get("HF_ADMIN_MODE", "false").lower() == "true"
+HF_MAX_FILE_SIZE     = int(os.environ.get("HF_MAX_FILE_SIZE", str(100 * 1024 * 1024)))
 HF_INFERENCE_TIMEOUT = int(os.environ.get("HF_INFERENCE_TIMEOUT", "30"))
-MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
-MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
+MCP_HOST             = os.environ.get("MCP_HOST", "0.0.0.0")
+MCP_PORT             = int(os.environ.get("MCP_PORT", "8000"))
+MCP_PATH             = os.environ.get("MCP_PATH", "/mcp")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("hf-mcp-server")
 
 api = HfApi(token=HF_TOKEN or None)
 mcp = FastMCP("hf-mcp-server", stateless_http=True)
 
 
+# ── HELPERS ───────────────────────────────────────────────
 def safe_run(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
@@ -54,7 +61,7 @@ def hf_system_info() -> dict:
     whoami = safe_run(api.whoami) if HF_TOKEN else None
     return {
         "server": "hf-mcp-server",
-        "version": "2.0.0-http",
+        "version": "2.0.1-http",
         "transport": "streamable-http",
         "endpoint": f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         "read_only": HF_READ_ONLY,
@@ -534,9 +541,15 @@ def hf_repo_file_manager(
 
 # ── ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    logging.getLogger("hf-mcp-server").info(
-        f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}"
+    log.info(f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}")
+
+    # mcp.server.fastmcp.run() does NOT support host/port/path kwargs.
+    # We mount the ASGI app manually and drive it with uvicorn.
+    starlette_app = mcp.http_app(path=MCP_PATH)
+
+    uvicorn.run(
+        starlette_app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+        log_level="info",
     )
-    mcp.run(transport="http", host=MCP_HOST, port=MCP_PORT, path=MCP_PATH)
