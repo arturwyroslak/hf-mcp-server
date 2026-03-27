@@ -2,12 +2,14 @@
 """
 HuggingFace MCP Server — Streamable HTTP transport
 Endpoint: http://0.0.0.0:8000/mcp
+Health:   http://0.0.0.0:8000/health
 """
 
 import os
 import json
 import fnmatch
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from starlette.applications import Starlette
@@ -69,7 +71,7 @@ def hf_system_info() -> dict:
     whoami = safe_run(api.whoami) if HF_TOKEN else None
     return {
         "server": "hf-mcp-server",
-        "version": "2.0.3-http",
+        "version": "2.0.4-http",
         "transport": "streamable-http",
         "endpoint": f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         "read_only": HF_READ_ONLY,
@@ -547,25 +549,40 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
-# ── HEALTH ENDPOINT (plain GET, no MCP headers needed) ────────
-async def health(request: Request):
-    return JSONResponse({"status": "ok", "version": "2.0.3-http"})
+# ── HEALTH ASGI app (plain GET /health, no MCP lifecycle needed) ──
+async def health_app(scope, receive, send):
+    """Minimal ASGI handler for /health — no Starlette overhead."""
+    response = JSONResponse({"status": "ok", "version": "2.0.4-http"})
+    await response(scope, receive, send)
+
+
+# ── ROUTER MIDDLEWARE ──────────────────────────────────────
+class RouterMiddleware:
+    """
+    Lightweight ASGI router that intercepts GET /health and
+    forwards everything else to the real MCP app (preserving
+    its lifespan so StreamableHTTPSessionManager initialises).
+    """
+    def __init__(self, mcp_asgi_app):
+        self.mcp_app = mcp_asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/health":
+            await health_app(scope, receive, send)
+        else:
+            await self.mcp_app(scope, receive, send)
 
 
 # ── ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
     log.info(f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}")
 
-    # Get the MCP Starlette app (handles POST /mcp + GET /mcp with SSE)
-    mcp_app = mcp.streamable_http_app()
-
-    # Wrap in a top-level Starlette app so we can add /health
-    app = Starlette(
-        routes=[
-            Route("/health", health, methods=["GET"]),
-            Mount("/", app=mcp_app),
-        ]
-    )
+    # streamable_http_app() returns a Starlette app with its own lifespan
+    # that starts StreamableHTTPSessionManager's task group on startup.
+    # We MUST NOT wrap it in another Starlette() — that kills the lifespan.
+    # Instead we use a thin ASGI middleware that intercepts /health only.
+    mcp_asgi = mcp.streamable_http_app()
+    app = RouterMiddleware(mcp_asgi)
 
     uvicorn.run(
         app,
