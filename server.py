@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
+import contextlib
 import os
 import json
 import fnmatch
 import logging
 
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from huggingface_hub import (
@@ -21,11 +27,17 @@ HF_MAX_FILE_SIZE     = int(os.environ.get("HF_MAX_FILE_SIZE", str(100 * 1024 * 1
 HF_INFERENCE_TIMEOUT = int(os.environ.get("HF_INFERENCE_TIMEOUT", "30"))
 MCP_HOST             = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT             = int(os.environ.get("MCP_PORT", "8000"))
+# Comma-separated allowed Host headers. Default "*" = accept anything.
+MCP_ALLOWED_HOSTS    = os.environ.get("MCP_ALLOWED_HOSTS", "*")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hf-mcp")
 
 api = HfApi(token=HF_TOKEN or None)
+
+_allowed_hosts = [h.strip() for h in MCP_ALLOWED_HOSTS.split(",") if h.strip()]
+# "*" means disable host validation entirely
+_security = None if "*" in _allowed_hosts else TransportSecuritySettings(allowed_hosts=_allowed_hosts)
 
 mcp = FastMCP(
     "hf-mcp-server",
@@ -53,7 +65,7 @@ def admin_guard():
 def hf_system_info() -> dict:
     """Return server status and HF connectivity."""
     return {
-        "version": "3.0.0",
+        "version": "3.1.0",
         "read_only": HF_READ_ONLY,
         "admin_mode": HF_ADMIN_MODE,
         "token_set": bool(HF_TOKEN),
@@ -474,11 +486,31 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
+# ── ASGI app ──────────────────────────────────────────────
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        yield
+
+
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "version": "3.1.0"})
+
+
+# Pass security_settings=None to disable host validation entirely (wildcard mode)
+# or pass TransportSecuritySettings(allowed_hosts=[...]) to restrict
+app = Starlette(
+    lifespan=lifespan,
+    routes=[
+        Route("/health", health),
+        Mount("/mcp", app=mcp.streamable_http_app(
+            security_settings=_security,
+        )),
+    ],
+)
+
+
 if __name__ == "__main__":
     log.info(f"Starting HF MCP Server on {MCP_HOST}:{MCP_PORT}")
-    mcp.run(
-        transport="streamable-http",
-        host=MCP_HOST,
-        port=MCP_PORT,
-        path="/mcp",
-    )
+    log.info(f"Allowed hosts: {MCP_ALLOWED_HOSTS}")
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
