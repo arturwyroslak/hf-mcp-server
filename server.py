@@ -32,6 +32,7 @@ log = logging.getLogger("hf-mcp")
 
 api = HfApi(token=HF_TOKEN or None)
 
+# stateless_http=True => each request is independent, no session needed
 mcp = FastMCP(
     "hf-mcp-server",
     stateless_http=True,
@@ -480,24 +481,48 @@ def hf_repo_file_manager(
 
 
 # ── ASGI app ─────────────────────────────────────────────────────────────────
+
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "version": "3.1.0"})
+
+
+# Build the MCP ASGI sub-app once
+_mcp_app = mcp.streamable_http_app()
+
+
+# Wrap in a custom lifespan that boots the MCP session manager
 @contextlib.asynccontextmanager
 async def lifespan(app):
     async with mcp.session_manager.run():
         yield
 
 
-async def health(request: Request):
-    return JSONResponse({"status": "ok", "version": "3.1.0"})
-
-
-# streamable_http_app() with NO extra kwargs — compatible with older SDK versions
+# KEY FIX:
+#  - Mount at "/mcp" strips the prefix, so the inner app sees "/"
+#  - Route("/health") must come BEFORE the Mount so it takes priority
+#  - GET /mcp  -> 307 -> GET /mcp/  was 404 because inner app had no GET /
+#    => use mcp.http_app() path="/mcp" OR mount at "/mcp" and ensure
+#       trailing-slash requests hit the POST handler inside the sub-app
+#
+# stateless_http=True means inner router handles POST / (root of sub-app)
+# Starlette Mount strips "/mcp" prefix before passing to sub-app, so
+# POST /mcp  => inner app sees POST /  ✔
+# POST /mcp/ => inner app sees POST /  ✔  (Starlette normalises)
+#
+# The 307 redirect loop happened because GET /mcp was being redirected to
+# GET /mcp/ by Starlette's redirect_slashes=True (default). We disable it.
 app = Starlette(
     lifespan=lifespan,
     routes=[
-        Route("/health", health),
-        Mount("/mcp", app=mcp.streamable_http_app()),
+        Route("/health", health, methods=["GET"]),
+        Route("/health/", health, methods=["GET"]),
+        Mount("/mcp", app=_mcp_app),
     ],
+    # Disable automatic slash redirects to prevent 307 -> 404 loops
+    # on GET /mcp -> GET /mcp/
 )
+# Monkey-patch: turn off redirect_slashes so GET /mcp doesn't 307
+app.router.redirect_slashes = False
 
 
 if __name__ == "__main__":
