@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  hf-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hf-mcp-server:latest
+    container_name: hf-mcp-server
+    restart: unless-stopped
+    stdin_open: true      # required for stdio MCP transport
+    tty: false
+    environment:
+      # Required: your HuggingFace token
+      HF_TOKEN: ${HF_TOKEN}
+      # Optional flags
+      HF_READ_ONLY: ${HF_READ_ONLY:-false}
+      HF_ADMIN_MODE: ${HF_ADMIN_MODE:-false}
+      HF_MAX_FILE_SIZE: ${HF_MAX_FILE_SIZE:-104857600}
+      HF_INFERENCE_TIMEOUT: ${HF_INFERENCE_TIMEOUT:-30}
+    volumes:
+      # Cache HuggingFace downloads between restarts
+      - hf_cache:/home/mcpuser/.cache/huggingface
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hf_cache:
+    driver: local
