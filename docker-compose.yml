@@ -19,8 +19,9 @@ services:
       - "${MCP_PORT:-8000}:8000"
     volumes:
       - hf_cache:/home/mcpuser/.cache/huggingface
+    networks:
+      - dokploy-network
     healthcheck:
-      # /health zwraca 200 OK dla prostego GET bez nagłówków MCP
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
@@ -35,3 +36,7 @@ services:
 volumes:
   hf_cache:
     driver: local
+
+networks:
+  dokploy-network:
+    external: true
