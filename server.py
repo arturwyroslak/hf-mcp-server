@@ -6,11 +6,9 @@ import fnmatch
 import logging
 
 import uvicorn
-from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Mount, Route
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 from mcp.server.fastmcp import FastMCP
 from huggingface_hub import (
     HfApi,
@@ -69,12 +67,8 @@ def hf_system_info() -> dict:
 
 @mcp.tool()
 def hf_repository_manager(
-    action: str,
-    repo_id: str,
-    repo_type: str = "model",
-    private: bool = False,
-    description: str = "",
-    space_sdk: str = "",
+    action: str, repo_id: str, repo_type: str = "model",
+    private: bool = False, description: str = "", space_sdk: str = "",
 ) -> dict:
     """Manage HF repositories. action: create | delete | info | list_files"""
     if action == "info":
@@ -97,22 +91,13 @@ def hf_repository_manager(
 
 @mcp.tool()
 def hf_file_operations(
-    action: str,
-    repo_id: str,
-    filename: str = "",
-    repo_type: str = "model",
-    content: str = "",
-    commit_message: str = "",
-    old_text: str = "",
-    new_text: str = "",
-    max_size: int = 500000,
-    chunk_size: int = 0,
-    chunk_number: int = 0,
-    pattern: str = "",
-    replacement: str = "",
+    action: str, repo_id: str, filename: str = "", repo_type: str = "model",
+    content: str = "", commit_message: str = "", old_text: str = "",
+    new_text: str = "", max_size: int = 500000, chunk_size: int = 0,
+    chunk_number: int = 0, pattern: str = "", replacement: str = "",
     file_patterns: list = None,
 ) -> dict:
-    """CRUD on HF repo files. action: read | write | edit | delete | validate | backup | batch_edit"""
+    """CRUD on HF repo files. action: read|write|edit|delete|validate|backup|batch_edit"""
     if file_patterns is None:
         file_patterns = ["*.md"]
     if action == "read":
@@ -198,7 +183,8 @@ def hf_file_operations(
 
 
 @mcp.tool()
-def hf_search_hub(content_type: str, query: str = "", author: str = "", filter_tag: str = "", limit: int = 20) -> dict:
+def hf_search_hub(content_type: str, query: str = "", author: str = "",
+                  filter_tag: str = "", limit: int = 20) -> dict:
     """Search HF Hub. content_type: models | datasets | spaces"""
     try:
         kw = dict(search=query or None, author=author or None, filter=filter_tag or None, limit=limit)
@@ -219,7 +205,7 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "", filter_t
 
 @mcp.tool()
 def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time: int = 300) -> dict:
-    """Manage HF Spaces. action: runtime_info | restart | pause | set_sleep_time | duplicate"""
+    """Manage HF Spaces. action: runtime_info|restart|pause|set_sleep_time|duplicate"""
     if action == "runtime_info":
         r = safe_run(api.get_space_runtime, repo_id=space_id)
         return r if isinstance(r, dict) else r.__dict__
@@ -234,14 +220,15 @@ def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time:
         return {"sleep_time_set": str(safe_run(api.set_space_sleep_time, repo_id=space_id, sleep_time=sleep_time))}
     if action == "duplicate":
         read_only_guard()
-        return {"duplicated_to": to_id, "result": str(safe_run(api.duplicate_space, from_id=space_id, to_id=to_id, exist_ok=True))}
+        return {"duplicated_to": to_id,
+                "result": str(safe_run(api.duplicate_space, from_id=space_id, to_id=to_id, exist_ok=True))}
     return {"error": f"Unknown action: {action}"}
 
 
 @mcp.tool()
 def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
                           title: str = "", description: str = "") -> dict:
-    """Community features. action: like | unlike | get_likes | create_discussion | get_commits | get_refs"""
+    """Community features. action: like|unlike|get_likes|create_discussion|get_commits|get_refs"""
     if action == "like":
         read_only_guard(); safe_run(api.like, repo_id=repo_id, repo_type=repo_type); return {"liked": repo_id}
     if action == "unlike":
@@ -271,7 +258,7 @@ def hf_repo_file_manager(
     old_text: str = "", new_text: str = "", commit_message: str = "",
     private: bool = False, description: str = "", space_sdk: str = "",
 ) -> dict:
-    """Unified repo+file manager. action: repo_create|repo_delete|repo_info|list_files|file_read|file_write|file_edit|file_delete|file_rename"""
+    """Unified repo+file manager."""
     if action == "repo_create":
         return hf_repository_manager("create", repo_id, repo_type, private, description, space_sdk)
     if action == "repo_delete":
@@ -303,41 +290,49 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
-# ── ASGI app ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+# STRATEGY: run MCP app directly as root ASGI app.
+# Wrap it with a thin middleware that intercepts /health before MCP sees it.
+# MCP's streamable_http_app() registers its handler at "/" internally,
+# so we DON'T mount it under /mcp — instead we rewrite the path in middleware.
+#
+# Traefik (Dokploy) strips the domain prefix, so:
+#   https://hf-mcp.sudvid.ai/mcp  ->  container sees  POST /mcp
+#
+# PathRewriteMiddleware rewrites:
+#   /mcp   ->  /mcp    (pass through to MCP app that listens on /mcp)
+#   /mcp/  ->  /mcp/   (same)
+#   /health -> intercept and return 200
+#
+# Actually the cleanest solution: run mcp app via mcp.run() with
+# transport="streamable-http" which handles everything internally.
+# ─────────────────────────────────────────────────────────────────────
 
-async def health(request: Request):
-    return JSONResponse({"status": "ok", "version": "3.1.0"})
+class HealthMiddleware:
+    """
+    Intercepts GET /health before the MCP app sees it.
+    Everything else is passed through unchanged.
+    """
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path in ("/health", "/health/"):
+                response = JSONResponse({"status": "ok", "version": "3.1.0"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
-# Build MCP ASGI sub-app — streamable HTTP handler lives at its own root
+# mcp.streamable_http_app() returns an ASGI app that handles:
+#   POST /mcp      -> MCP JSON-RPC
+#   GET  /mcp      -> SSE stream (for clients that use SSE)
+#   DELETE /mcp    -> close session
+# It registers these routes at /mcp internally.
 _mcp_asgi = mcp.streamable_http_app()
-
-
-@contextlib.asynccontextmanager
-async def lifespan(app):
-    async with mcp.session_manager.run():
-        yield
-
-
-# STRATEGY: run TWO separate Starlette apps:
-#   - main app handles /health
-#   - MCP sub-app mounted at /mcp via Mount
-#
-# Mount("/mcp") strips the /mcp prefix and passes the rest to _mcp_asgi
-# So POST /mcp  -> _mcp_asgi sees POST /
-#    POST /mcp/ -> _mcp_asgi sees POST /
-#
-# redirect_slashes=False prevents 307 GET /mcp -> GET /mcp/ loops
-app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Route("/health", health, methods=["GET", "HEAD"]),
-        Route("/health/", health, methods=["GET", "HEAD"]),
-        # Mount strips /mcp prefix before forwarding
-        Mount("/mcp", app=_mcp_asgi),
-    ],
-)
-app.router.redirect_slashes = False
+app = HealthMiddleware(_mcp_asgi)
 
 
 if __name__ == "__main__":
