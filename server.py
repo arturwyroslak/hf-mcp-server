@@ -10,6 +10,10 @@ import fnmatch
 import logging
 
 import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
 from mcp.server.fastmcp import FastMCP
 from huggingface_hub import (
     HfApi,
@@ -33,9 +37,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("hf-mcp-server")
 
 api = HfApi(token=HF_TOKEN or None)
-
-# host/port passed here are used only by mcp.run() (not our path).
-# stateless_http=True disables session state between calls.
 mcp = FastMCP(
     "hf-mcp-server",
     stateless_http=True,
@@ -68,7 +69,7 @@ def hf_system_info() -> dict:
     whoami = safe_run(api.whoami) if HF_TOKEN else None
     return {
         "server": "hf-mcp-server",
-        "version": "2.0.2-http",
+        "version": "2.0.3-http",
         "transport": "streamable-http",
         "endpoint": f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         "read_only": HF_READ_ONLY,
@@ -546,14 +547,25 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
+# ── HEALTH ENDPOINT (plain GET, no MCP headers needed) ────────
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "version": "2.0.3-http"})
+
+
 # ── ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
     log.info(f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}")
 
-    # mcp.streamable_http_app() returns a Starlette ASGI app.
-    # The MCP endpoint is mounted internally at MCP_PATH.
-    # We then hand it to uvicorn for host/port binding.
-    app = mcp.streamable_http_app()
+    # Get the MCP Starlette app (handles POST /mcp + GET /mcp with SSE)
+    mcp_app = mcp.streamable_http_app()
+
+    # Wrap in a top-level Starlette app so we can add /health
+    app = Starlette(
+        routes=[
+            Route("/health", health, methods=["GET"]),
+            Mount("/", app=mcp_app),
+        ]
+    )
 
     uvicorn.run(
         app,

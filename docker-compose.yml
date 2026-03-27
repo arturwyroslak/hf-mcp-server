@@ -20,7 +20,8 @@ services:
     volumes:
       - hf_cache:/home/mcpuser/.cache/huggingface
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/mcp"]
+      # /health zwraca 200 OK dla prostego GET bez nagłówków MCP
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
