@@ -6,7 +6,6 @@ import fnmatch
 import logging
 
 import uvicorn
-from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from mcp.server.fastmcp import FastMCP
@@ -210,11 +209,9 @@ def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time:
         r = safe_run(api.get_space_runtime, repo_id=space_id)
         return r if isinstance(r, dict) else r.__dict__
     if action == "restart":
-        read_only_guard()
-        return {"restarted": str(safe_run(api.restart_space, repo_id=space_id))}
+        read_only_guard(); return {"restarted": str(safe_run(api.restart_space, repo_id=space_id))}
     if action == "pause":
-        read_only_guard()
-        return {"paused": str(safe_run(api.pause_space, repo_id=space_id))}
+        read_only_guard(); return {"paused": str(safe_run(api.pause_space, repo_id=space_id))}
     if action == "set_sleep_time":
         read_only_guard()
         return {"sleep_time_set": str(safe_run(api.set_space_sleep_time, repo_id=space_id, sleep_time=sleep_time))}
@@ -234,8 +231,7 @@ def hf_community_features(action: str, repo_id: str = "", repo_type: str = "mode
     if action == "unlike":
         read_only_guard(); safe_run(api.unlike, repo_id=repo_id, repo_type=repo_type); return {"unliked": repo_id}
     if action == "get_likes":
-        r = safe_run(api.list_liked_repos)
-        return {"liked_repos": [str(x) for x in (r or [])]}
+        return {"liked_repos": [str(x) for x in (safe_run(api.list_liked_repos) or [])]}
     if action == "create_discussion":
         read_only_guard()
         r = safe_run(api.create_discussion, repo_id=repo_id, repo_type=repo_type,
@@ -290,49 +286,47 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
-# ─────────────────────────────────────────────────────────────────────
-# STRATEGY: run MCP app directly as root ASGI app.
-# Wrap it with a thin middleware that intercepts /health before MCP sees it.
-# MCP's streamable_http_app() registers its handler at "/" internally,
-# so we DON'T mount it under /mcp — instead we rewrite the path in middleware.
-#
-# Traefik (Dokploy) strips the domain prefix, so:
-#   https://hf-mcp.sudvid.ai/mcp  ->  container sees  POST /mcp
-#
-# PathRewriteMiddleware rewrites:
-#   /mcp   ->  /mcp    (pass through to MCP app that listens on /mcp)
-#   /mcp/  ->  /mcp/   (same)
-#   /health -> intercept and return 200
-#
-# Actually the cleanest solution: run mcp app via mcp.run() with
-# transport="streamable-http" which handles everything internally.
-# ─────────────────────────────────────────────────────────────────────
+# ── ASGI middleware stack ──────────────────────────────────────────────────────
 
-class HealthMiddleware:
+class FixHeadersMiddleware:
     """
-    Intercepts GET /health before the MCP app sees it.
-    Everything else is passed through unchanged.
+    Two jobs:
+    1. Intercept GET /health -> return 200 immediately.
+    2. Rewrite Host header to 'localhost:{port}' so that the MCP SDK's
+       built-in host validation (which causes 421 Misdirected Request
+       for external hostnames) passes without disabling security entirely.
     """
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, port: int = 8000):
         self.app = app
+        self._localhost = f"localhost:{port}".encode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] == "http":
             path = scope.get("path", "")
+
+            # Intercept health check
             if path in ("/health", "/health/"):
                 response = JSONResponse({"status": "ok", "version": "3.1.0"})
                 await response(scope, receive, send)
                 return
+
+            # Rewrite Host + origin headers so MCP SDK accepts the request
+            headers = list(scope.get("headers", []))
+            new_headers = []
+            for name, value in headers:
+                if name.lower() == b"host":
+                    new_headers.append((b"host", self._localhost))
+                elif name.lower() == b"origin":
+                    new_headers.append((b"origin", b"http://" + self._localhost))
+                else:
+                    new_headers.append((name, value))
+            scope["headers"] = new_headers
+
         await self.app(scope, receive, send)
 
 
-# mcp.streamable_http_app() returns an ASGI app that handles:
-#   POST /mcp      -> MCP JSON-RPC
-#   GET  /mcp      -> SSE stream (for clients that use SSE)
-#   DELETE /mcp    -> close session
-# It registers these routes at /mcp internally.
 _mcp_asgi = mcp.streamable_http_app()
-app = HealthMiddleware(_mcp_asgi)
+app = FixHeadersMiddleware(_mcp_asgi, port=MCP_PORT)
 
 
 if __name__ == "__main__":
