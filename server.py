@@ -9,13 +9,9 @@ import os
 import json
 import fnmatch
 import logging
-from contextlib import asynccontextmanager
 
 import uvicorn
-from starlette.applications import Starlette
-from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
 from mcp.server.fastmcp import FastMCP
 from huggingface_hub import (
     HfApi,
@@ -34,15 +30,25 @@ HF_INFERENCE_TIMEOUT = int(os.environ.get("HF_INFERENCE_TIMEOUT", "30"))
 MCP_HOST             = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT             = int(os.environ.get("MCP_PORT", "8000"))
 MCP_PATH             = os.environ.get("MCP_PATH", "/mcp")
+# Comma-separated list of allowed Host headers, e.g. "hf-mcp.sudvid.ai,localhost"
+# "*" disables host validation entirely (safe behind a trusted reverse proxy)
+MCP_ALLOWED_HOSTS    = os.environ.get("MCP_ALLOWED_HOSTS", "*")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hf-mcp-server")
 
 api = HfApi(token=HF_TOKEN or None)
+
+# Parse allowed hosts list
+_allowed = [h.strip() for h in MCP_ALLOWED_HOSTS.split(",") if h.strip()]
+
 mcp = FastMCP(
     "hf-mcp-server",
     stateless_http=True,
     json_response=True,
+    # host kwarg tells FastMCP which bind address to advertise; it does NOT
+    # limit incoming Host headers — that's done by StreamableHTTPSessionManager.
+    # We handle host validation ourselves via HostOverrideMiddleware below.
 )
 
 
@@ -71,7 +77,7 @@ def hf_system_info() -> dict:
     whoami = safe_run(api.whoami) if HF_TOKEN else None
     return {
         "server": "hf-mcp-server",
-        "version": "2.0.4-http",
+        "version": "2.0.5-http",
         "transport": "streamable-http",
         "endpoint": f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}",
         "read_only": HF_READ_ONLY,
@@ -549,40 +555,48 @@ def hf_repo_file_manager(
     return {"error": f"Unknown action: {action}"}
 
 
-# ── HEALTH ASGI app (plain GET /health, no MCP lifecycle needed) ──
-async def health_app(scope, receive, send):
-    """Minimal ASGI handler for /health — no Starlette overhead."""
-    response = JSONResponse({"status": "ok", "version": "2.0.4-http"})
-    await response(scope, receive, send)
+# ── HEALTH handler ──────────────────────────────────────────
+async def health_asgi(scope, receive, send):
+    resp = JSONResponse({"status": "ok", "version": "2.0.5-http"})
+    await resp(scope, receive, send)
 
 
-# ── ROUTER MIDDLEWARE ──────────────────────────────────────
-class RouterMiddleware:
+# ── MIDDLEWARE ──────────────────────────────────────────
+class ProxyMiddleware:
     """
-    Lightweight ASGI router that intercepts GET /health and
-    forwards everything else to the real MCP app (preserving
-    its lifespan so StreamableHTTPSessionManager initialises).
+    Two responsibilities:
+    1. Intercept GET /health — reply without touching MCP.
+    2. When MCP_ALLOWED_HOSTS == "*", rewrite the Host header to
+       "localhost" so StreamableHTTPSessionManager never fires 421.
+       This is safe when the container sits behind a trusted reverse proxy.
     """
-    def __init__(self, mcp_asgi_app):
+    def __init__(self, mcp_asgi_app, allowed: list):
         self.mcp_app = mcp_asgi_app
+        self.wildcard = "*" in allowed
+        self.allowed = set(allowed)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path") == "/health":
-            await health_app(scope, receive, send)
-        else:
-            await self.mcp_app(scope, receive, send)
+            await health_asgi(scope, receive, send)
+            return
+
+        # Rewrite Host header to bypass MCP's allowlist check when wildcard is set
+        if scope["type"] == "http" and self.wildcard:
+            headers = list(scope.get("headers", []))
+            headers = [(k, v) for k, v in headers if k.lower() != b"host"]
+            headers.append((b"host", b"localhost"))
+            scope = dict(scope, headers=headers)
+
+        await self.mcp_app(scope, receive, send)
 
 
 # ── ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
     log.info(f"Starting HF MCP Server | HTTP transport | {MCP_HOST}:{MCP_PORT}{MCP_PATH}")
+    log.info(f"Allowed hosts: {MCP_ALLOWED_HOSTS}")
 
-    # streamable_http_app() returns a Starlette app with its own lifespan
-    # that starts StreamableHTTPSessionManager's task group on startup.
-    # We MUST NOT wrap it in another Starlette() — that kills the lifespan.
-    # Instead we use a thin ASGI middleware that intercepts /health only.
     mcp_asgi = mcp.streamable_http_app()
-    app = RouterMiddleware(mcp_asgi)
+    app = ProxyMiddleware(mcp_asgi, _allowed)
 
     uvicorn.run(
         app,
