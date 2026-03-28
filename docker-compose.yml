@@ -10,32 +10,31 @@ services:
       HF_TOKEN: ${HF_TOKEN}
       HF_READ_ONLY: ${HF_READ_ONLY:-false}
       HF_ADMIN_MODE: ${HF_ADMIN_MODE:-false}
-      HF_MAX_FILE_SIZE: ${HF_MAX_FILE_SIZE:-104857600}
-      HF_INFERENCE_TIMEOUT: ${HF_INFERENCE_TIMEOUT:-30}
       MCP_HOST: ${MCP_HOST:-0.0.0.0}
       MCP_PORT: ${MCP_PORT:-8000}
-      MCP_PATH: ${MCP_PATH:-/mcp}
+      HF_UPLOAD_TIMEOUT: ${HF_UPLOAD_TIMEOUT:-300}
+      HF_CACHE_TTL: ${HF_CACHE_TTL:-180}
+      # Uvicorn performance
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     ports:
       - "${MCP_PORT:-8000}:8000"
-    volumes:
-      - hf_cache:/home/mcpuser/.cache/huggingface
     networks:
       - dokploy-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  hf_cache:
-    driver: local
+    # Tune kernel TCP buffers for low-latency
+    sysctls:
+      net.core.somaxconn: 1024
+      net.ipv4.tcp_fin_timeout: 15
 
 networks:
   dokploy-network:
