@@ -50,7 +50,7 @@ log = logging.getLogger("hf-mcp")
 api = HfApi(token=HF_TOKEN or None, endpoint="https://huggingface.co")
 _executor = ThreadPoolExecutor(max_workers=16)
 
-# ── HTTP client (singleton, HTTP/2, connection pool) ──────────────────────────
+# ── HTTP client ──────────────────────────────────────────────────────────────────
 _http_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -70,12 +70,9 @@ def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
-# ── In-memory cache with TTL ──────────────────────────────────────────────────
-_file_cache: dict = {}  # key -> (timestamp, result_dict)
-
-# ── In-flight deduplication: prevents N parallel requests for the same file ───
-# If two callers request the same file at the same time, only 1 HTTP request fires.
-_in_flight: dict[str, asyncio.Future] = {}
+# ── Cache ────────────────────────────────────────────────────────────────────────
+_file_cache: dict = {}
+_in_flight: dict = {}
 
 def _cache_key(repo_id: str, filename: str, repo_type: str) -> str:
     return hashlib.md5(f"{repo_type}/{repo_id}/{filename}".encode()).hexdigest()
@@ -91,49 +88,36 @@ def _cache_set(key: str, repo_id: str, repo_type: str, value: dict):
     _file_cache[key] = (time.monotonic(), value)
     if len(_file_cache) > 300:
         cutoff = time.monotonic() - HF_CACHE_TTL
-        expired = [k for k, (ts, _) in list(_file_cache.items()) if ts < cutoff]
-        for k in expired:
+        for k in [k for k, (ts, _) in list(_file_cache.items()) if ts < cutoff]:
             _file_cache.pop(k, None)
 
 def _cache_invalidate(repo_id: str, repo_type: str):
     tag = f"{repo_type}/{repo_id}"
-    to_del = [k for k, (_, v) in list(_file_cache.items()) if v.get("_repo") == tag]
-    for k in to_del:
+    for k in [k for k, (_, v) in list(_file_cache.items()) if v.get("_repo") == tag]:
         _file_cache.pop(k, None)
-    log.info(f"Cache invalidated {len(to_del)} entries for {tag}")
 
-# ── Core file fetcher with deduplication ─────────────────────────────────────
+# ── Core fetcher with deduplication ───────────────────────────────────────────
 async def fetch_file_http(repo_id: str, filename: str, repo_type: str,
                           max_size: int = 500_000) -> dict:
     key = _cache_key(repo_id, filename, repo_type)
-
-    # Cache hit
     cached = _cache_get(key)
     if cached:
         return {**cached, "_cached": True}
-
-    # Deduplication: if same file is already being fetched, wait for that future
     if key in _in_flight:
         try:
             return await asyncio.shield(_in_flight[key])
         except Exception:
             pass
-
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     _in_flight[key] = fut
-
     try:
         client = get_http_client()
         url = f"https://huggingface.co/{repo_type}s/{repo_id}/resolve/main/{filename}"
         resp = await client.get(url)
         resp.raise_for_status()
         raw = resp.text
-        result = {
-            "content": raw[:max_size],
-            "size": len(raw),
-            "truncated": len(raw) > max_size,
-        }
+        result = {"content": raw[:max_size], "size": len(raw), "truncated": len(raw) > max_size}
         _cache_set(key, repo_id, repo_type, result)
         fut.set_result(result)
         return result
@@ -148,7 +132,7 @@ async def fetch_file_http(repo_id: str, filename: str, repo_type: str,
     finally:
         _in_flight.pop(key, None)
 
-# ── Thread pool runner ────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 async def run_in_thread(fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     try:
@@ -169,7 +153,6 @@ def safe_run(fn, *args, **kwargs):
         log.error(f"{fn.__name__} failed: {e}")
         return {"error": str(e), "type": type(e).__name__}
 
-# ── Edit engine ───────────────────────────────────────────────────────────────
 def _apply_edits(text: str, edits: list) -> tuple:
     edit_log = []
     for i, edit in enumerate(edits):
@@ -229,17 +212,6 @@ def _apply_edits(text: str, edits: list) -> tuple:
             edit_log.append({"edit": i, "mode": mode, "status": "error", "detail": str(e)})
     return text, edit_log
 
-def _is_text_file(filename: str) -> bool:
-    TEXT_EXTS = {
-        ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", ".scss",
-        ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".md", ".txt",
-        ".sh", ".bash", ".env", ".dockerfile", ".xml", ".svg", ".rst",
-        ".go", ".rs", ".java", ".c", ".cpp", ".h", ".rb", ".php",
-        ".vue", ".svelte", ".graphql", ".sql", ".csv",
-    }
-    ext = os.path.splitext(filename.lower())[1]
-    return ext in TEXT_EXTS or filename in ("Dockerfile", ".gitignore", ".gitattributes", "Makefile")
-
 def read_only_guard():
     if HF_READ_ONLY:
         raise PermissionError("Server is in READ-ONLY mode.")
@@ -248,24 +220,65 @@ def admin_guard():
     if not HF_ADMIN_MODE:
         raise PermissionError("Admin mode is disabled.")
 
-# ── MCP setup ─────────────────────────────────────────────────────────────────
+# ── MCP ───────────────────────────────────────────────────────────────────────────
 mcp = FastMCP("hf-mcp-server", stateless_http=True, json_response=True)
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def hf_system_info() -> dict:
     """Server status, version, cache stats."""
     return {
-        "version": "5.1.0",
+        "version": "5.2.0",
         "read_only": HF_READ_ONLY,
         "admin_mode": HF_ADMIN_MODE,
         "token_set": bool(HF_TOKEN),
-        "upload_timeout": HF_UPLOAD_TIMEOUT,
         "cache_ttl": HF_CACHE_TTL,
         "cache_entries": len(_file_cache),
         "in_flight": len(_in_flight),
         "whoami": safe_run(api.whoami) if HF_TOKEN else None,
+    }
+
+
+@mcp.tool()
+async def hf_list_files(
+    repo_id: str,
+    repo_type: str = "space",
+) -> dict:
+    """
+    Returns full file tree of a HF repo with path, size, type for every entry.
+    ALWAYS call this first before reading or modifying any files.
+    Use the returned list to decide which files are relevant to the task —
+    then fetch only those with hf_read_many.
+
+    Decision guide for which files to read next:
+    - Entrypoints first: app.py, main.py, index.html, index.js, server.py
+    - Config files: requirements.txt, package.json, Dockerfile, docker-compose.yml, .env*
+    - Files whose name/extension matches the feature you are working on
+    - Ignore: *.png, *.jpg, *.woff, *.lock, node_modules/*, __pycache__/*
+    """
+    client = get_http_client()
+    url = (f"https://huggingface.co/api/{repo_type}s/{repo_id}/tree/main"
+           "?recursive=true&expand=false")
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        items = _loads(resp.text)
+    except Exception as e:
+        return {"error": str(e)}
+
+    tree = [
+        {
+            "path": it["path"],
+            "type": it.get("type", "file"),
+            "size": it.get("size"),
+        }
+        for it in items
+    ]
+    files = [it["path"] for it in tree if it["type"] == "file"]
+    return {
+        "tree": tree,
+        "file_count": len(files),
+        "files": files,
     }
 
 
@@ -277,88 +290,14 @@ async def hf_read_many(
     max_size_per_file: int = 200_000,
 ) -> dict:
     """
-    Read multiple files IN PARALLEL from a HF repo in one call.
+    Read multiple files IN PARALLEL from a HF repo in a single call.
     Returns {filename: {content, size, truncated} | {error}}.
-    Cached for HF_CACHE_TTL seconds. Deduplicates concurrent identical requests.
-    Use before modifying files when you know which files you need.
+    Results cached for HF_CACHE_TTL seconds.
+    Call after hf_list_files — pass only the files relevant to your task.
     """
     tasks = [fetch_file_http(repo_id, f, repo_type, max_size_per_file) for f in filenames]
     results = await asyncio.gather(*tasks)
     return dict(zip(filenames, results))
-
-
-@mcp.tool()
-async def hf_repo_snapshot(
-    repo_id: str,
-    repo_type: str = "space",
-    include_patterns: list = None,
-    exclude_patterns: list = None,
-    max_size_per_file: int = 100_000,
-    max_total_size: int = 1_500_000,
-) -> dict:
-    """
-    Full repository snapshot — structure + ALL text file contents IN PARALLEL.
-    ALWAYS call this first before any modification to get full codebase context.
-    include_patterns: e.g. ["*.py","*.html"] — whitelist
-    exclude_patterns: blacklist (binaries excluded by default)
-    Returns: tree, files (content dict), stats.
-    """
-    if include_patterns is None:
-        include_patterns = []
-    if exclude_patterns is None:
-        exclude_patterns = [
-            "*.lock", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico",
-            "*.woff", "*.woff2", "*.ttf", "*.eot", "*.zip", "*.tar",
-            "*.gz", "*.bin", "*.pkl", "*.pt", "*.pth", "*.ckpt",
-            "*.safetensors", ".git/*", "node_modules/*", "__pycache__/*",
-        ]
-
-    client = get_http_client()
-    tree_url = (f"https://huggingface.co/api/{repo_type}s/{repo_id}/tree/main"
-                "?recursive=true&expand=false")
-    try:
-        resp = await client.get(tree_url)
-        resp.raise_for_status()
-        items = _loads(resp.text)
-    except Exception as e:
-        return {"error": f"Failed to get file tree: {e}"}
-
-    tree = [{"path": it["path"], "size": it.get("size"), "type": it.get("type", "file")}
-            for it in items]
-    all_paths = [it["path"] for it in items if it.get("type", "file") == "file"]
-
-    def should_include(fname: str) -> bool:
-        if not _is_text_file(fname): return False
-        if any(fnmatch.fnmatch(fname, p) for p in exclude_patterns): return False
-        if include_patterns and not any(fnmatch.fnmatch(fname, p) for p in include_patterns): return False
-        return True
-
-    to_read = [p for p in all_paths if should_include(p)]
-    skipped = [p for p in all_paths if not should_include(p)]
-
-    # All files in parallel
-    tasks = [fetch_file_http(repo_id, f, repo_type, max_size_per_file) for f in to_read]
-    results_list = await asyncio.gather(*tasks)
-
-    files_content, total_read = {}, 0
-    for fname, result in zip(to_read, results_list):
-        if total_read >= max_total_size:
-            skipped.append(fname)
-            continue
-        files_content[fname] = result
-        total_read += result.get("size", 0)
-
-    return {
-        "tree": tree,
-        "files": files_content,
-        "stats": {
-            "total_files": len(all_paths),
-            "files_read": len(files_content),
-            "files_skipped": len(skipped),
-            "bytes_read": total_read,
-            "cached": sum(1 for r in results_list if r.get("_cached")),
-        },
-    }
 
 
 @mcp.tool()
@@ -370,11 +309,15 @@ async def hf_smart_edit(
     commit_message: str = "",
 ) -> dict:
     """
-    Intelligent single-file editor — applies multiple edits in ONE commit.
+    Edit a single file with multiple surgical operations in ONE commit.
     Modes: replace | regex | insert_after | insert_before | delete_lines | overwrite
-    replace: {"mode":"replace","old":"...","new":"..."}
-    regex:   {"mode":"regex","pattern":"...","replacement":"...","flags":"MULTILINE"}
-    Edits applied sequentially. Cache auto-invalidated after write.
+    replace:       {"mode":"replace","old":"exact text","new":"new text"}
+    regex:         {"mode":"regex","pattern":"...","replacement":"...","flags":"MULTILINE"}
+    insert_after:  {"mode":"insert_after","after_pattern":"line anchor","insert":"new line"}
+    insert_before: {"mode":"insert_before","before_pattern":"line anchor","insert":"new line"}
+    delete_lines:  {"mode":"delete_lines","line_pattern":"pattern to match"}
+    overwrite:     {"mode":"overwrite","content":"full new content"}
+    Edits applied sequentially. Cache auto-invalidated on write.
     """
     read_only_guard()
     result = await fetch_file_http(repo_id, filename, repo_type, max_size=2_000_000)
@@ -406,18 +349,17 @@ async def hf_atomic_commit(
     pr_description: str = "",
 ) -> dict:
     """
-    Commit multiple file changes atomically in ONE HF commit. Always prefer this over
-    multiple hf_smart_edit calls. Edit ops fetch files IN PARALLEL.
+    Commit multiple file changes atomically in ONE HF commit.
+    ALWAYS prefer this over multiple hf_smart_edit calls for multi-file changes.
     ops:
-      add:    {"op":"add","path":"x.py","content":"..."}
+      add:    {"op":"add","path":"x.py","content":"full content"}
       delete: {"op":"delete","path":"x.py"}
-      rename: {"op":"rename","from":"a.py","to":"b.py"}
-      copy:   {"op":"copy","from":"a.py","to":"b.py"}
+      rename: {"op":"rename","from":"old.py","to":"new.py"}
+      copy:   {"op":"copy","from":"src.py","to":"dst.py"}
       edit:   {"op":"edit","path":"x.py","edits":[{"mode":"replace",...}]}
+    edit ops fetch files IN PARALLEL before building the commit.
     """
     read_only_guard()
-
-    # Fetch all "edit" targets in parallel
     edit_items = [(i, item) for i, item in enumerate(files) if item.get("op") == "edit"]
     if edit_items:
         fetched_list = await asyncio.gather(
@@ -446,11 +388,11 @@ async def hf_atomic_commit(
                 src_path_in_repo=item["from"], dest_path_in_repo=item["to"]))
         elif op == "edit":
             fname = item["path"]
-            fetch_result = fetched_map.get(fname, {})
-            if "error" in fetch_result:
-                edit_logs[fname] = {"error": fetch_result}
+            fr = fetched_map.get(fname, {})
+            if "error" in fr:
+                edit_logs[fname] = {"error": fr}
                 continue
-            text, log_entries = _apply_edits(fetch_result["content"], item.get("edits", []))
+            text, log_entries = _apply_edits(fr["content"], item.get("edits", []))
             edit_logs[fname] = log_entries
             operations.append(CommitOperationAdd(
                 path_in_repo=fname, path_or_fileobj=text.encode()))
@@ -475,15 +417,12 @@ async def hf_atomic_commit(
 @mcp.tool()
 def hf_repository_manager(
     action: str, repo_id: str, repo_type: str = "model",
-    private: bool = False, description: str = "", space_sdk: str = "",
+    private: bool = False, space_sdk: str = "",
 ) -> dict:
-    """Manage HF repositories. action: create | delete | info | list_files"""
+    """Manage HF repositories. action: create | delete | info"""
     if action == "info":
         r = safe_run(api.repo_info, repo_id=repo_id, repo_type=repo_type)
         return r if isinstance(r, dict) else r.__dict__
-    if action == "list_files":
-        files = safe_run(api.list_repo_files, repo_id=repo_id, repo_type=repo_type)
-        return {"files": list(files) if not isinstance(files, dict) else files}
     if action == "create":
         read_only_guard()
         r = safe_run(api.create_repo, repo_id=repo_id, repo_type=repo_type,
@@ -502,7 +441,7 @@ async def hf_file_operations(
     content: str = "", commit_message: str = "", old_text: str = "",
     new_text: str = "", max_size: int = 500_000,
 ) -> dict:
-    """Single-file CRUD. action: read | write | edit | delete | validate | backup"""
+    """Single-file CRUD fallback. action: read | write | edit | delete | validate | backup"""
     if action == "read":
         return await fetch_file_http(repo_id, filename, repo_type, max_size)
     if action == "write":
@@ -562,7 +501,7 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "",
     try:
         kw = dict(search=query or None, author=author or None,
                   filter=filter_tag or None, limit=limit)
-        if content_type == "models":   items = api.list_models(**kw)
+        if content_type == "models":     items = api.list_models(**kw)
         elif content_type == "datasets": items = api.list_datasets(**kw)
         else:                            items = api.list_spaces(**kw)
         return {"results": [{"id": getattr(i, "id", None) or getattr(i, "modelId", None),
@@ -576,7 +515,7 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "",
 @mcp.tool()
 def hf_space_management(action: str, space_id: str, to_id: str = "",
                         sleep_time: int = 300) -> dict:
-    """Manage HF Spaces. action: runtime_info|restart|pause|set_sleep_time|duplicate"""
+    """Manage HF Spaces. action: runtime_info | restart | pause | set_sleep_time | duplicate"""
     if action == "runtime_info":
         r = safe_run(api.get_space_runtime, repo_id=space_id)
         return r if isinstance(r, dict) else r.__dict__
@@ -600,7 +539,7 @@ def hf_space_management(action: str, space_id: str, to_id: str = "",
 @mcp.tool()
 def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
                           title: str = "", description: str = "") -> dict:
-    """Community. action: like|unlike|get_likes|create_discussion|get_commits|get_refs"""
+    """Community. action: like | unlike | get_likes | create_discussion | get_commits | get_refs"""
     if action == "like":
         read_only_guard(); safe_run(api.like, repo_id=repo_id, repo_type=repo_type)
         return {"liked": repo_id}
@@ -627,19 +566,16 @@ def hf_community_features(action: str, repo_id: str = "", repo_type: str = "mode
 # ── ASGI stack ────────────────────────────────────────────────────────────────
 
 class HeaderFixMiddleware:
-    """Rewrites Host/Origin headers (bypasses MCP 421) and handles /health."""
     def __init__(self, app: ASGIApp, port: int = 8000):
         self.app = app
         self._localhost = f"localhost:{port}".encode()
-        self._health_body = _dumps({"status": "ok", "version": "5.1.0"}).encode()
+        self._health_body = _dumps({"status": "ok", "version": "5.2.0"}).encode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] == "http":
             if scope.get("path", "") in ("/health", "/health/"):
-                await Response(
-                    content=self._health_body,
-                    media_type="application/json",
-                )(scope, receive, send)
+                await Response(content=self._health_body,
+                               media_type="application/json")(scope, receive, send)
                 return
             scope["headers"] = [
                 (b"host", self._localhost) if n.lower() == b"host"
@@ -651,20 +587,19 @@ class HeaderFixMiddleware:
 
 
 _mcp_asgi = mcp.streamable_http_app()
-# Stack: GZip compression -> header fix -> MCP
 app = GZipMiddleware(HeaderFixMiddleware(_mcp_asgi, port=MCP_PORT), minimum_size=500)
 
 if __name__ == "__main__":
-    log.info(f"Starting HF MCP Server v5.1.0 on {MCP_HOST}:{MCP_PORT} workers={WEB_CONCURRENCY}")
+    log.info(f"Starting HF MCP Server v5.2.0 on {MCP_HOST}:{MCP_PORT} workers={WEB_CONCURRENCY}")
     uvicorn.run(
         "server:app",
         host=MCP_HOST,
         port=MCP_PORT,
         workers=WEB_CONCURRENCY,
-        log_level="warning",      # less log noise = faster I/O
-        access_log=False,          # disable access log for speed
-        loop="uvloop",             # faster event loop
-        http="httptools",          # faster HTTP parser
+        log_level="warning",
+        access_log=False,
+        loop="uvloop",
+        http="httptools",
         timeout_keep_alive=30,
         timeout_graceful_shutdown=5,
     )
