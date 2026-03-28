@@ -35,7 +35,20 @@ _executor = ThreadPoolExecutor(max_workers=16)
 
 _http_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 _http_client: Optional[httpx.AsyncClient] = None
-_HEALTH_BODY = _dumps({"status": "ok", "v": "5.3.0"}).encode()
+_HEALTH_BODY = _dumps({"status": "ok", "v": "5.4.0"}).encode()
+
+# Cache whoami to avoid repeated API calls
+_whoami_cache: Optional[dict] = None
+
+def _get_whoami() -> dict:
+    global _whoami_cache
+    if _whoami_cache is None and HF_TOKEN:
+        try:
+            info = api.whoami()
+            _whoami_cache = {"name": info.get("name", ""), "type": info.get("type", "user")}
+        except Exception as e:
+            return {"error": str(e)}
+    return _whoami_cache or {"error": "no token"}
 
 def get_http() -> httpx.AsyncClient:
     global _http_client
@@ -145,19 +158,92 @@ def _aguard():
 
 mcp = FastMCP("hf-mcp", stateless_http=True, json_response=True)
 
-# ── TOOLS ── keep descriptions SHORT (fewer tokens = faster AI decisions) ────
+# ── TOOLS ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def hf_whoami() -> dict:
+    """
+    Returns the authenticated HF username. ALWAYS call this first when you need
+    the username to build repo_id (format: username/repo-name).
+    Never search or guess the username — just call this.
+    """
+    return _get_whoami()
+
+
+@mcp.tool()
+async def hf_create_space_with_files(
+    space_name: str,
+    files: list,
+    sdk: str = "static",
+    private: bool = False,
+    commit_message: str = "Initial upload",
+) -> dict:
+    """
+    Create a HF Space AND upload all files in ONE call. Fastest way to deploy.
+    Automatically resolves username — no need to call hf_whoami separately.
+    space_name: just the name without username, e.g. "my-portfolio"
+    files: [{"path": "index.html", "content": "..."}]
+    sdk: static (default) | gradio | streamlit | docker
+    Returns: {repo_id, url, files_uploaded, commit}
+    """
+    _rguard()
+    whoami = _get_whoami()
+    if "error" in whoami:
+        return whoami
+    username = whoami["name"]
+    repo_id = f"{username}/{space_name}"
+
+    # Step 1: create space
+    create_result = _safe(
+        api.create_repo,
+        repo_id=repo_id, repo_type="space",
+        space_sdk=sdk, private=private, exist_ok=True,
+    )
+    if isinstance(create_result, dict) and "error" in create_result:
+        return create_result
+
+    # Step 2: commit all files atomically
+    if not files:
+        return {"repo_id": repo_id, "url": f"https://huggingface.co/spaces/{repo_id}",
+                "files_uploaded": 0, "warning": "no files provided"}
+
+    operations = [
+        CommitOperationAdd(
+            path_in_repo=f["path"],
+            path_or_fileobj=f["content"].encode(),
+        )
+        for f in files
+    ]
+    commit = await _run(
+        api.create_commit,
+        repo_id=repo_id, repo_type="space",
+        operations=operations,
+        commit_message=commit_message,
+    )
+    if isinstance(commit, dict) and "error" in commit:
+        return {"repo_id": repo_id, "created": True, "upload_error": commit["error"]}
+
+    return {
+        "repo_id": repo_id,
+        "url": f"https://huggingface.co/spaces/{repo_id}",
+        "files_uploaded": len(files),
+        "commit": str(commit),
+    }
+
 
 @mcp.tool()
 def hf_system_info() -> dict:
     """Server status and cache stats."""
-    return {"v":"5.3.0","ro":HF_READ_ONLY,"admin":HF_ADMIN_MODE,
-            "token":bool(HF_TOKEN),"cache":len(_cache),"flight":len(_flight)}
+    return {"v":"5.4.0","ro":HF_READ_ONLY,"admin":HF_ADMIN_MODE,
+            "token":bool(HF_TOKEN),"cache":len(_cache),"flight":len(_flight),
+            "whoami": _get_whoami()}
+
 
 @mcp.tool()
 async def hf_list_files(repo_id: str, repo_type: str = "space") -> dict:
     """
     Returns file tree (path, size, type) for a HF repo.
-    STEP 1: Always call this first. Then use hf_read_many for only relevant files.
+    Call before reading/modifying. Then use hf_read_many for relevant files only.
     Skip: *.png *.jpg *.woff *.lock node_modules __pycache__
     """
     try:
@@ -169,15 +255,17 @@ async def hf_list_files(repo_id: str, repo_type: str = "space") -> dict:
         return {"tree":tree,"files":[x["path"] for x in tree if x["type"]=="file"]}
     except Exception as e: return {"error": str(e)}
 
+
 @mcp.tool()
 async def hf_read_many(repo_id: str, filenames: list, repo_type: str = "space",
                        max_size_per_file: int = 200_000) -> dict:
     """
-    Read multiple files in parallel. STEP 2 after hf_list_files.
+    Read multiple files in parallel. Call after hf_list_files.
     Returns {filename: {content,size,truncated}}. Cached 3min.
     """
     results = await asyncio.gather(*[_fetch(repo_id, f, repo_type, max_size_per_file) for f in filenames])
     return dict(zip(filenames, results))
+
 
 @mcp.tool()
 async def hf_smart_edit(repo_id: str, filename: str, edits: list,
@@ -185,7 +273,7 @@ async def hf_smart_edit(repo_id: str, filename: str, edits: list,
     """
     Edit one file with surgical ops in one commit. Cache auto-cleared.
     modes: replace|regex|insert_after|insert_before|delete_lines|overwrite
-    replace: {mode,old,new} regex: {mode,pattern,replacement,flags}
+    replace: {mode,old,new}  regex: {mode,pattern,replacement,flags}
     """
     _rguard()
     res = await _fetch(repo_id, filename, repo_type, 2_000_000)
@@ -198,11 +286,12 @@ async def hf_smart_edit(repo_id: str, filename: str, edits: list,
     _cinv(repo_id, repo_type)
     return {"status":"ok","result":str(r),"log":elog}
 
+
 @mcp.tool()
 async def hf_atomic_commit(repo_id: str, files: list, commit_message: str,
                            repo_type: str = "space", create_pr: bool = False) -> dict:
     """
-    Commit multiple files atomically. Prefer over multiple hf_smart_edit calls.
+    Commit multiple files atomically in ONE commit. Use for all multi-file changes.
     ops: add{op,path,content} delete{op,path} rename{op,from,to} edit{op,path,edits[]}
     """
     _rguard()
@@ -232,6 +321,7 @@ async def hf_atomic_commit(repo_id: str, files: list, commit_message: str,
     _cinv(repo_id, repo_type)
     return {"status":"ok","commit":str(r),"ops":len(ops),"logs":elogs} if not isinstance(r,dict) else r
 
+
 @mcp.tool()
 def hf_repository_manager(action: str, repo_id: str, repo_type: str = "model",
                           private: bool = False, space_sdk: str = "") -> dict:
@@ -247,12 +337,13 @@ def hf_repository_manager(action: str, repo_id: str, repo_type: str = "model",
         return {"deleted":repo_id}
     return {"error":f"unknown: {action}"}
 
+
 @mcp.tool()
 async def hf_file_operations(action: str, repo_id: str, filename: str = "",
                              repo_type: str = "space", content: str = "",
                              commit_message: str = "", old_text: str = "",
                              new_text: str = "", max_size: int = 500_000) -> dict:
-    """File CRUD fallback. action: read|write|edit|delete|validate|backup"""
+    """Single-file CRUD fallback. action: read|write|edit|delete|validate|backup"""
     if action=="read": return await _fetch(repo_id,filename,repo_type,max_size)
     if action=="write":
         _rguard()
@@ -291,6 +382,7 @@ async def hf_file_operations(action: str, repo_id: str, filename: str = "",
         return {"backup":f"{filename}.backup","result":str(r)}
     return {"error":f"unknown: {action}"}
 
+
 @mcp.tool()
 def hf_search_hub(content_type: str, query: str = "", author: str = "",
                  filter_tag: str = "", limit: int = 20) -> dict:
@@ -304,6 +396,7 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "",
                             "author":getattr(i,"author",None),"likes":getattr(i,"likes",None)} for i in items]}
     except Exception as e: return {"error":str(e)}
 
+
 @mcp.tool()
 def hf_space_management(action: str, space_id: str, to_id: str = "",
                         sleep_time: int = 300) -> dict:
@@ -316,6 +409,7 @@ def hf_space_management(action: str, space_id: str, to_id: str = "",
     if action=="set_sleep_time": _rguard(); return {"set":str(_safe(api.set_space_sleep_time,repo_id=space_id,sleep_time=sleep_time))}
     if action=="duplicate": _rguard(); return {"to":to_id,"result":str(_safe(api.duplicate_space,from_id=space_id,to_id=to_id,exist_ok=True))}
     return {"error":f"unknown: {action}"}
+
 
 @mcp.tool()
 def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
@@ -336,10 +430,11 @@ def hf_community_features(action: str, repo_id: str = "", repo_type: str = "mode
         return r if isinstance(r,dict) else r.__dict__
     return {"error":f"unknown: {action}"}
 
+
 # ── ASGI ──────────────────────────────────────────────────────────────────────
 
 class FastMiddleware:
-    """Health endpoint + Host/Origin header fix for MCP 421 bypass."""
+    """Health endpoint + Host/Origin header fix."""
     __slots__ = ("app", "_lh")
     def __init__(self, app: ASGIApp, port: int = 8000):
         self.app = app
