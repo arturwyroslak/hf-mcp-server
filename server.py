@@ -3,10 +3,14 @@ import asyncio
 import os
 import re
 import json
+import time
 import fnmatch
 import logging
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
+import httpx
 import uvicorn
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -21,29 +25,98 @@ from huggingface_hub import (
 HF_TOKEN             = os.environ.get("HF_TOKEN", "")
 HF_READ_ONLY         = os.environ.get("HF_READ_ONLY", "false").lower() == "true"
 HF_ADMIN_MODE        = os.environ.get("HF_ADMIN_MODE", "false").lower() == "true"
-HF_MAX_FILE_SIZE     = int(os.environ.get("HF_MAX_FILE_SIZE", str(100 * 1024 * 1024)))
-HF_INFERENCE_TIMEOUT = int(os.environ.get("HF_INFERENCE_TIMEOUT", "30"))
 HF_UPLOAD_TIMEOUT    = int(os.environ.get("HF_UPLOAD_TIMEOUT", "300"))
 MCP_HOST             = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT             = int(os.environ.get("MCP_PORT", "8000"))
+HF_CACHE_TTL         = int(os.environ.get("HF_CACHE_TTL", "120"))  # seconds
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hf-mcp")
 
 api = HfApi(token=HF_TOKEN or None, endpoint="https://huggingface.co")
-_executor = ThreadPoolExecutor(max_workers=8)
+_executor = ThreadPoolExecutor(max_workers=16)
+
+# Shared async httpx client — reused across all requests, avoids connection overhead
+_http_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+_http_client: Optional[httpx.AsyncClient] = None
+
+# In-memory file content cache: key -> (timestamp, content_dict)
+_file_cache: dict = {}
 
 mcp = FastMCP("hf-mcp-server", stateless_http=True, json_response=True)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def safe_run(fn, *args, **kwargs):
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            headers=_http_headers,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0),
+            follow_redirects=True,
+            http2=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
+
+
+def _cache_key(repo_id: str, filename: str, repo_type: str) -> str:
+    return hashlib.md5(f"{repo_type}/{repo_id}/{filename}".encode()).hexdigest()
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    entry = _file_cache.get(key)
+    if entry and (time.time() - entry[0]) < HF_CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: dict):
+    _file_cache[key] = (time.time(), value)
+    # Evict old entries if cache grows large
+    if len(_file_cache) > 200:
+        now = time.time()
+        expired = [k for k, (ts, _) in _file_cache.items() if now - ts > HF_CACHE_TTL]
+        for k in expired:
+            _file_cache.pop(k, None)
+
+
+def _cache_invalidate(repo_id: str, repo_type: str = "space"):
+    """Invalidate all cached files for a repo after a write."""
+    prefix = hashlib.md5(f"{repo_type}/{repo_id}/".encode()).hexdigest()[:8]
+    to_del = [k for k in _file_cache if _file_cache[k][1].get("_repo") == f"{repo_type}/{repo_id}"]
+    for k in to_del:
+        _file_cache.pop(k, None)
+
+
+async def fetch_file_http(repo_id: str, filename: str, repo_type: str,
+                          max_size: int = 500_000) -> dict:
+    """Fetch file content directly via HTTP — faster than hf_hub_download (no disk I/O)."""
+    cache_key = _cache_key(repo_id, filename, repo_type)
+    cached = _cache_get(cache_key)
+    if cached:
+        log.info(f"Cache hit: {repo_id}/{filename}")
+        return cached
+
+    client = get_http_client()
+    url = f"https://huggingface.co/{repo_type}s/{repo_id}/resolve/main/{filename}"
     try:
-        return fn(*args, **kwargs)
+        resp = await client.get(url)
+        resp.raise_for_status()
+        raw = resp.text
+        result = {
+            "content": raw[:max_size],
+            "size": len(raw),
+            "truncated": len(raw) > max_size,
+            "_repo": f"{repo_type}/{repo_id}",
+        }
+        _cache_set(cache_key, result)
+        return result
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
     except Exception as e:
-        log.error(f"{fn.__name__} failed: {e}")
-        return {"error": str(e), "type": type(e).__name__}
+        return {"error": str(e)}
 
 
 async def run_in_thread(fn, *args, **kwargs):
@@ -56,17 +129,16 @@ async def run_in_thread(fn, *args, **kwargs):
     except asyncio.TimeoutError:
         return {"error": f"Timed out after {HF_UPLOAD_TIMEOUT}s"}
     except Exception as e:
-        log.error(f"{fn.__name__} failed: {e}")
+        log.error(f"{getattr(fn, '__name__', str(fn))} failed: {e}")
         return {"error": str(e), "type": type(e).__name__}
 
 
-def _read_local(path: str, max_size: int = 500_000) -> dict:
+def safe_run(fn, *args, **kwargs):
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
-        return {"content": text[:max_size], "size": len(text), "truncated": len(text) > max_size}
+        return fn(*args, **kwargs)
     except Exception as e:
-        return {"error": str(e)}
+        log.error(f"{fn.__name__} failed: {e}")
+        return {"error": str(e), "type": type(e).__name__}
 
 
 def _is_text_file(filename: str) -> bool:
@@ -79,6 +151,67 @@ def _is_text_file(filename: str) -> bool:
     }
     ext = os.path.splitext(filename.lower())[1]
     return ext in TEXT_EXTS or filename in ("Dockerfile", ".gitignore", ".gitattributes", "Makefile")
+
+
+def _apply_edits(text: str, edits: list) -> tuple[str, list]:
+    """Apply a list of edit operations to text. Returns (new_text, edit_log)."""
+    edit_log = []
+    for i, edit in enumerate(edits):
+        mode = edit.get("mode", "replace")
+        try:
+            if mode == "overwrite":
+                text = edit["content"]
+                edit_log.append({"edit": i, "mode": mode, "status": "ok"})
+            elif mode == "replace":
+                old = edit["old"]
+                if old not in text:
+                    edit_log.append({"edit": i, "mode": mode, "status": "not_found"})
+                    continue
+                count = text.count(old)
+                text = text.replace(old, edit["new"])
+                edit_log.append({"edit": i, "mode": mode, "status": "ok", "replacements": count})
+            elif mode == "regex":
+                flags = 0
+                for f in edit.get("flags", "").split("|"):
+                    n = f.strip().upper()
+                    if n == "IGNORECASE": flags |= re.IGNORECASE
+                    elif n == "MULTILINE": flags |= re.MULTILINE
+                    elif n == "DOTALL": flags |= re.DOTALL
+                text, count = re.subn(edit["pattern"], edit["replacement"], text, flags=flags)
+                edit_log.append({"edit": i, "mode": mode, "status": "ok", "substitutions": count})
+            elif mode == "insert_after":
+                lines = text.splitlines(keepends=True)
+                out, found = [], False
+                for line in lines:
+                    out.append(line)
+                    if edit["after_pattern"] in line:
+                        ins = edit["insert"]
+                        out.append(ins if ins.endswith("\n") else ins + "\n")
+                        found = True
+                text = "".join(out)
+                edit_log.append({"edit": i, "mode": mode, "status": "ok" if found else "not_found"})
+            elif mode == "insert_before":
+                lines = text.splitlines(keepends=True)
+                out, found = [], False
+                for line in lines:
+                    if edit["before_pattern"] in line:
+                        ins = edit["insert"]
+                        out.append(ins if ins.endswith("\n") else ins + "\n")
+                        found = True
+                    out.append(line)
+                text = "".join(out)
+                edit_log.append({"edit": i, "mode": mode, "status": "ok" if found else "not_found"})
+            elif mode == "delete_lines":
+                lines = text.splitlines(keepends=True)
+                new_lines = [l for l in lines if edit["line_pattern"] not in l]
+                text = "".join(new_lines)
+                edit_log.append({"edit": i, "mode": mode, "status": "ok",
+                                  "lines_deleted": len(lines) - len(new_lines)})
+            else:
+                edit_log.append({"edit": i, "mode": mode, "status": "unknown_mode"})
+        except Exception as e:
+            edit_log.append({"edit": i, "mode": mode, "status": "error", "detail": str(e)})
+    return text, edit_log
 
 
 def read_only_guard():
@@ -96,11 +229,13 @@ def admin_guard():
 def hf_system_info() -> dict:
     """Return server status, version and HF connectivity."""
     return {
-        "version": "4.0.0",
+        "version": "5.0.0",
         "read_only": HF_READ_ONLY,
         "admin_mode": HF_ADMIN_MODE,
         "token_set": bool(HF_TOKEN),
         "upload_timeout": HF_UPLOAD_TIMEOUT,
+        "cache_ttl": HF_CACHE_TTL,
+        "cache_entries": len(_file_cache),
         "whoami": safe_run(api.whoami) if HF_TOKEN else None,
     }
 
@@ -113,19 +248,16 @@ async def hf_read_many(
     max_size_per_file: int = 200_000,
 ) -> dict:
     """
-    Read multiple files from a HF repo in one call.
-    Returns a dict {filename: {content, size, truncated} | {error}}.
-    Perfect for getting full context of a Space before modifying it.
+    Read multiple files from a HF repo IN PARALLEL — fast, uses HTTP + cache.
+    Returns {filename: {content, size, truncated} | {error}}.
+    Use this before modifying specific files you already know.
     """
-    results = {}
-    for fname in filenames:
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=fname, repo_type=repo_type)
-        if isinstance(local, dict):
-            results[fname] = local
-        else:
-            results[fname] = _read_local(local, max_size_per_file)
-    return results
+    tasks = [
+        fetch_file_http(repo_id, fname, repo_type, max_size_per_file)
+        for fname in filenames
+    ]
+    results_list = await asyncio.gather(*tasks)
+    return dict(zip(filenames, results_list))
 
 
 @mcp.tool()
@@ -135,48 +267,39 @@ async def hf_repo_snapshot(
     include_patterns: list = None,
     exclude_patterns: list = None,
     max_size_per_file: int = 100_000,
-    max_total_size: int = 1_000_000,
+    max_total_size: int = 1_500_000,
 ) -> dict:
     """
-    Full repository snapshot — returns structure + content of all text files.
+    Full repository snapshot — returns structure + content of ALL text files IN PARALLEL.
+    Use as FIRST step before any modification to get full codebase context.
     include_patterns: e.g. ["*.py", "*.html"] — only include matching files.
-    exclude_patterns: e.g. ["*.lock", "node_modules/*"] — skip matching files.
-    Use this as the FIRST step before any modification to understand the full codebase.
-    Returns:
-      - tree: list of all files with sizes
-      - files: {filename: content} for all readable text files
-      - stats: total files, total size read, skipped
+    exclude_patterns: skip matching files (binaries excluded by default).
+    Returns: tree (all files), files (content dict), stats.
     """
     if include_patterns is None:
         include_patterns = []
     if exclude_patterns is None:
-        exclude_patterns = ["*.lock", "*.png", "*.jpg", "*.jpeg", "*.gif",
-                             "*.ico", "*.woff", "*.woff2", "*.ttf", "*.eot",
-                             "*.zip", "*.tar", "*.gz", "*.bin", "*.pkl",
-                             "*.pt", "*.pth", "*.ckpt", "*.safetensors",
-                             ".git/*", "node_modules/*", "__pycache__/*"]
+        exclude_patterns = [
+            "*.lock", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico",
+            "*.woff", "*.woff2", "*.ttf", "*.eot", "*.zip", "*.tar",
+            "*.gz", "*.bin", "*.pkl", "*.pt", "*.pth", "*.ckpt",
+            "*.safetensors", ".git/*", "node_modules/*", "__pycache__/*",
+        ]
 
-    # Get file list
-    raw_files = safe_run(api.list_repo_tree, repo_id=repo_id, repo_type=repo_type, recursive=True)
-    if isinstance(raw_files, dict) and "error" in raw_files:
-        # Fallback to list_repo_files
-        raw_files = safe_run(api.list_repo_files, repo_id=repo_id, repo_type=repo_type)
-        if isinstance(raw_files, dict):
-            return raw_files
-        tree = [{"path": f, "size": None} for f in raw_files]
-        all_paths = list(raw_files)
-    else:
-        tree = []
-        all_paths = []
-        for item in (raw_files or []):
-            if hasattr(item, "path"):
-                size = getattr(item, "size", None)
-                tree.append({"path": item.path, "size": size,
-                              "type": getattr(item, "type", "file")})
-                if getattr(item, "type", "file") == "file":
-                    all_paths.append(item.path)
+    # Get file tree via HTTP — faster than list_repo_tree blocking call
+    client = get_http_client()
+    tree_url = (f"https://huggingface.co/api/{repo_type}s/{repo_id}/tree/main"
+                f"?recursive=true&expand=false")
+    try:
+        resp = await client.get(tree_url)
+        resp.raise_for_status()
+        items = resp.json()
+        tree = [{"path": it["path"], "size": it.get("size"), "type": it.get("type", "file")}
+                for it in items]
+        all_paths = [it["path"] for it in items if it.get("type", "file") == "file"]
+    except Exception as e:
+        return {"error": f"Failed to get file tree: {e}"}
 
-    # Filter
     def should_include(fname: str) -> bool:
         if not _is_text_file(fname):
             return False
@@ -189,21 +312,18 @@ async def hf_repo_snapshot(
     to_read = [p for p in all_paths if should_include(p)]
     skipped = [p for p in all_paths if not should_include(p)]
 
-    # Read files, stop at total size limit
+    # Fetch ALL files in parallel
+    tasks = [fetch_file_http(repo_id, fname, repo_type, max_size_per_file) for fname in to_read]
+    results_list = await asyncio.gather(*tasks)
+
     files_content = {}
     total_read = 0
-    for fname in to_read:
+    for fname, result in zip(to_read, results_list):
         if total_read >= max_total_size:
             skipped.append(fname)
             continue
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=fname, repo_type=repo_type)
-        if isinstance(local, dict):
-            files_content[fname] = local
-        else:
-            result = _read_local(local, max_size_per_file)
-            files_content[fname] = result
-            total_read += result.get("size", 0)
+        files_content[fname] = result
+        total_read += result.get("size", 0)
 
     return {
         "tree": tree,
@@ -226,131 +346,20 @@ async def hf_smart_edit(
     commit_message: str = "",
 ) -> dict:
     """
-    Intelligent file editor — applies multiple edits to a single file in one commit.
-    Each edit in `edits` is a dict with one of these modes:
-
-    1. Replace exact text:
-       {"mode": "replace", "old": "exact old text", "new": "new text"}
-
-    2. Regex substitution:
-       {"mode": "regex", "pattern": "regex pattern", "replacement": "new text", "flags": "IGNORECASE"}
-       flags: IGNORECASE, MULTILINE, DOTALL (combine with |)
-
-    3. Insert after line containing pattern:
-       {"mode": "insert_after", "after_pattern": "text to find", "insert": "lines to insert"}
-
-    4. Insert before line containing pattern:
-       {"mode": "insert_before", "before_pattern": "text to find", "insert": "lines to insert"}
-
-    5. Replace entire file:
-       {"mode": "overwrite", "content": "full new file content"}
-
-    6. Delete lines matching pattern:
-       {"mode": "delete_lines", "line_pattern": "pattern to match lines for deletion"}
-
-    Edits are applied sequentially — the output of each edit is the input of the next.
-    Returns the final content and a log of each edit result.
+    Intelligent single-file editor — applies multiple edits in one commit.
+    Edit modes: replace | regex | insert_after | insert_before | delete_lines | overwrite
+    Each edit: {"mode": "replace", "old": "...", "new": "..."}
+    Regex: {"mode": "regex", "pattern": "...", "replacement": "...", "flags": "IGNORECASE|MULTILINE"}
+    Edits applied sequentially. Cache invalidated after write.
     """
     read_only_guard()
-
-    # Download current version
-    local = await run_in_thread(api.hf_hub_download,
-        repo_id=repo_id, filename=filename, repo_type=repo_type)
-    if isinstance(local, dict):
-        return local
-
-    with open(local, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-
-    original_text = text
-    edit_log = []
-
-    for i, edit in enumerate(edits):
-        mode = edit.get("mode", "replace")
-        try:
-            if mode == "overwrite":
-                text = edit["content"]
-                edit_log.append({"edit": i, "mode": mode, "status": "ok"})
-
-            elif mode == "replace":
-                old = edit["old"]
-                new = edit["new"]
-                if old not in text:
-                    edit_log.append({"edit": i, "mode": mode, "status": "not_found",
-                                     "detail": f"old text not found in file"})
-                    continue
-                count = text.count(old)
-                text = text.replace(old, new)
-                edit_log.append({"edit": i, "mode": mode, "status": "ok",
-                                  "replacements": count})
-
-            elif mode == "regex":
-                pattern = edit["pattern"]
-                replacement = edit["replacement"]
-                flag_str = edit.get("flags", "")
-                flags = 0
-                for flag_name in flag_str.split("|"):
-                    flag_name = flag_name.strip().upper()
-                    if flag_name == "IGNORECASE": flags |= re.IGNORECASE
-                    elif flag_name == "MULTILINE": flags |= re.MULTILINE
-                    elif flag_name == "DOTALL": flags |= re.DOTALL
-                new_text, count = re.subn(pattern, replacement, text, flags=flags)
-                text = new_text
-                edit_log.append({"edit": i, "mode": mode, "status": "ok",
-                                  "substitutions": count})
-
-            elif mode == "insert_after":
-                after_pattern = edit["after_pattern"]
-                insert = edit["insert"]
-                lines = text.splitlines(keepends=True)
-                new_lines = []
-                found = False
-                for line in lines:
-                    new_lines.append(line)
-                    if after_pattern in line:
-                        new_lines.append(insert if insert.endswith("\n") else insert + "\n")
-                        found = True
-                if not found:
-                    edit_log.append({"edit": i, "mode": mode, "status": "not_found"})
-                    continue
-                text = "".join(new_lines)
-                edit_log.append({"edit": i, "mode": mode, "status": "ok"})
-
-            elif mode == "insert_before":
-                before_pattern = edit["before_pattern"]
-                insert = edit["insert"]
-                lines = text.splitlines(keepends=True)
-                new_lines = []
-                found = False
-                for line in lines:
-                    if before_pattern in line:
-                        new_lines.append(insert if insert.endswith("\n") else insert + "\n")
-                        found = True
-                    new_lines.append(line)
-                if not found:
-                    edit_log.append({"edit": i, "mode": mode, "status": "not_found"})
-                    continue
-                text = "".join(new_lines)
-                edit_log.append({"edit": i, "mode": mode, "status": "ok"})
-
-            elif mode == "delete_lines":
-                line_pattern = edit["line_pattern"]
-                lines = text.splitlines(keepends=True)
-                new_lines = [l for l in lines if line_pattern not in l]
-                deleted = len(lines) - len(new_lines)
-                text = "".join(new_lines)
-                edit_log.append({"edit": i, "mode": mode, "status": "ok",
-                                  "lines_deleted": deleted})
-
-            else:
-                edit_log.append({"edit": i, "mode": mode, "status": "unknown_mode"})
-
-        except Exception as e:
-            edit_log.append({"edit": i, "mode": mode, "status": "error", "detail": str(e)})
-
-    if text == original_text:
+    result = await fetch_file_http(repo_id, filename, repo_type, max_size=2_000_000)
+    if "error" in result:
+        return result
+    original = result["content"]
+    text, edit_log = _apply_edits(original, edits)
+    if text == original:
         return {"status": "no_changes", "edit_log": edit_log}
-
     r = await run_in_thread(
         api.upload_file,
         path_or_fileobj=text.encode(),
@@ -359,6 +368,7 @@ async def hf_smart_edit(
         repo_type=repo_type,
         commit_message=commit_message or f"Smart edit {filename}",
     )
+    _cache_invalidate(repo_id, repo_type)
     return {"status": "ok", "uploaded": str(r), "edit_log": edit_log}
 
 
@@ -372,150 +382,71 @@ async def hf_atomic_commit(
     pr_description: str = "",
 ) -> dict:
     """
-    Commit multiple file changes atomically in a single HF commit.
-    This is the preferred way to make multi-file changes — avoids partial states.
-
-    `files` is a list of operation dicts:
-
-    Add / overwrite a file:
-      {"op": "add", "path": "app.py", "content": "file content as string"}
-
-    Delete a file:
-      {"op": "delete", "path": "old_file.py"}
-
-    Rename / move a file:
-      {"op": "rename", "from": "old.py", "to": "new.py"}
-
-    Copy a file:
-      {"op": "copy", "from": "src.py", "to": "dst.py"}
-
-    Smart-edit a file (apply edits list, same format as hf_smart_edit):
-      {"op": "edit", "path": "app.py", "edits": [{"mode": "replace", "old": "x", "new": "y"}]}
-
-    Returns commit URL or PR URL if create_pr=True.
+    Commit multiple file changes atomically in ONE HF commit. Preferred for multi-file changes.
+    ops: add {op,path,content} | delete {op,path} | rename {op,from,to} | copy {op,from,to}
+         edit {op,path,edits:[...]} — same edit format as hf_smart_edit
+    "edit" ops fetch files IN PARALLEL before building commit.
+    Cache invalidated after commit.
     """
     read_only_guard()
+
+    # Collect all "edit" ops that need file fetching, fetch in parallel
+    edit_items = [(i, item) for i, item in enumerate(files) if item.get("op") == "edit"]
+    if edit_items:
+        fetch_tasks = [
+            fetch_file_http(repo_id, item["path"], repo_type, max_size=2_000_000)
+            for _, item in edit_items
+        ]
+        fetched = await asyncio.gather(*fetch_tasks)
+    else:
+        fetched = []
+
+    fetched_map = {item["path"]: res for (_, item), res in zip(edit_items, fetched)}
 
     operations = []
     edit_logs = {}
 
     for item in files:
         op = item.get("op", "add")
-
         if op == "add":
-            content = item["content"]
-            operations.append(
-                CommitOperationAdd(
-                    path_in_repo=item["path"],
-                    path_or_fileobj=content.encode(),
-                )
-            )
-
+            operations.append(CommitOperationAdd(
+                path_in_repo=item["path"],
+                path_or_fileobj=item["content"].encode(),
+            ))
         elif op == "delete":
             operations.append(CommitOperationDelete(path_in_repo=item["path"]))
-
         elif op == "rename":
             operations.append(CommitOperationCopy(
                 src_path_in_repo=item["from"], dest_path_in_repo=item["to"]))
             operations.append(CommitOperationDelete(path_in_repo=item["from"]))
-
         elif op == "copy":
             operations.append(CommitOperationCopy(
                 src_path_in_repo=item["from"], dest_path_in_repo=item["to"]))
-
         elif op == "edit":
-            # Download, apply edits in memory, then add as modified content
             fname = item["path"]
-            local = await run_in_thread(api.hf_hub_download,
-                repo_id=repo_id, filename=fname, repo_type=repo_type)
-            if isinstance(local, dict):
-                edit_logs[fname] = {"error": local}
+            fetch_result = fetched_map.get(fname, {})
+            if "error" in fetch_result:
+                edit_logs[fname] = {"error": fetch_result}
                 continue
-            with open(local, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-
-            log_entries = []
-            for i, edit in enumerate(item.get("edits", [])):
-                mode = edit.get("mode", "replace")
-                try:
-                    if mode == "overwrite":
-                        text = edit["content"]
-                        log_entries.append({"edit": i, "mode": mode, "status": "ok"})
-                    elif mode == "replace":
-                        old = edit["old"]
-                        if old not in text:
-                            log_entries.append({"edit": i, "mode": mode, "status": "not_found"})
-                            continue
-                        text = text.replace(old, edit["new"])
-                        log_entries.append({"edit": i, "mode": mode, "status": "ok"})
-                    elif mode == "regex":
-                        flags = 0
-                        for flag_name in edit.get("flags", "").split("|"):
-                            n = flag_name.strip().upper()
-                            if n == "IGNORECASE": flags |= re.IGNORECASE
-                            elif n == "MULTILINE": flags |= re.MULTILINE
-                            elif n == "DOTALL": flags |= re.DOTALL
-                        text, count = re.subn(edit["pattern"], edit["replacement"], text, flags=flags)
-                        log_entries.append({"edit": i, "mode": mode, "status": "ok", "subs": count})
-                    elif mode == "insert_after":
-                        lines = text.splitlines(keepends=True)
-                        out, found = [], False
-                        for line in lines:
-                            out.append(line)
-                            if edit["after_pattern"] in line:
-                                ins = edit["insert"]
-                                out.append(ins if ins.endswith("\n") else ins + "\n")
-                                found = True
-                        text = "".join(out)
-                        log_entries.append({"edit": i, "mode": mode,
-                                            "status": "ok" if found else "not_found"})
-                    elif mode == "insert_before":
-                        lines = text.splitlines(keepends=True)
-                        out, found = [], False
-                        for line in lines:
-                            if edit["before_pattern"] in line:
-                                ins = edit["insert"]
-                                out.append(ins if ins.endswith("\n") else ins + "\n")
-                                found = True
-                            out.append(line)
-                        text = "".join(out)
-                        log_entries.append({"edit": i, "mode": mode,
-                                            "status": "ok" if found else "not_found"})
-                    elif mode == "delete_lines":
-                        lines = text.splitlines(keepends=True)
-                        new_lines = [l for l in lines if edit["line_pattern"] not in l]
-                        deleted = len(lines) - len(new_lines)
-                        text = "".join(new_lines)
-                        log_entries.append({"edit": i, "mode": mode, "status": "ok",
-                                            "lines_deleted": deleted})
-                except Exception as e:
-                    log_entries.append({"edit": i, "mode": mode, "status": "error", "detail": str(e)})
-
+            text, log_entries = _apply_edits(fetch_result["content"], item.get("edits", []))
             edit_logs[fname] = log_entries
-            operations.append(
-                CommitOperationAdd(path_in_repo=fname, path_or_fileobj=text.encode())
-            )
+            operations.append(CommitOperationAdd(
+                path_in_repo=fname, path_or_fileobj=text.encode()))
 
     if not operations:
-        return {"error": "No valid operations to commit", "edit_logs": edit_logs}
+        return {"error": "No valid operations", "edit_logs": edit_logs}
 
+    extra = {"pr_description": pr_description} if create_pr and pr_description else {}
     r = await run_in_thread(
         api.create_commit,
-        repo_id=repo_id,
-        repo_type=repo_type,
-        operations=operations,
-        commit_message=commit_message,
-        create_pr=create_pr,
-        **(({"pr_description": pr_description}) if create_pr and pr_description else {}),
+        repo_id=repo_id, repo_type=repo_type,
+        operations=operations, commit_message=commit_message,
+        create_pr=create_pr, **extra,
     )
+    _cache_invalidate(repo_id, repo_type)
     if isinstance(r, dict):
         return r
-    return {
-        "status": "ok",
-        "commit": str(r),
-        "operations": len(operations),
-        "edit_logs": edit_logs,
-    }
+    return {"status": "ok", "commit": str(r), "operations": len(operations), "edit_logs": edit_logs}
 
 
 @mcp.tool()
@@ -532,8 +463,8 @@ def hf_repository_manager(
         return {"files": list(files) if not isinstance(files, dict) else files}
     if action == "create":
         read_only_guard()
-        r = safe_run(api.create_repo, repo_id=repo_id, repo_type=repo_type, private=private,
-                     space_sdk=space_sdk or None, exist_ok=True)
+        r = safe_run(api.create_repo, repo_id=repo_id, repo_type=repo_type,
+                     private=private, space_sdk=space_sdk or None, exist_ok=True)
         return {"created": str(r)}
     if action == "delete":
         read_only_guard(); admin_guard()
@@ -550,26 +481,20 @@ async def hf_file_operations(
 ) -> dict:
     """Single-file CRUD. action: read | write | edit | delete | validate | backup"""
     if action == "read":
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=filename, repo_type=repo_type)
-        if isinstance(local, dict): return local
-        return _read_local(local, max_size)
-
+        return await fetch_file_http(repo_id, filename, repo_type, max_size)
     if action == "write":
         read_only_guard()
         r = await run_in_thread(api.upload_file,
             path_or_fileobj=content.encode(), path_in_repo=filename,
             repo_id=repo_id, repo_type=repo_type,
             commit_message=commit_message or f"Upload {filename}")
+        _cache_invalidate(repo_id, repo_type)
         return {"uploaded": str(r)}
-
     if action == "edit":
         read_only_guard()
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=filename, repo_type=repo_type)
-        if isinstance(local, dict): return local
-        with open(local, "r", encoding="utf-8", errors="replace") as f:
-            original = f.read()
+        result = await fetch_file_http(repo_id, filename, repo_type, max_size=2_000_000)
+        if "error" in result: return result
+        original = result["content"]
         if old_text not in original:
             return {"error": "old_text not found in file"}
         updated = original.replace(old_text, new_text)
@@ -577,42 +502,34 @@ async def hf_file_operations(
             path_or_fileobj=updated.encode(), path_in_repo=filename,
             repo_id=repo_id, repo_type=repo_type,
             commit_message=commit_message or f"Edit {filename}")
+        _cache_invalidate(repo_id, repo_type)
         return {"edited": str(r)}
-
     if action == "delete":
         read_only_guard()
         r = await run_in_thread(api.delete_file,
             path_in_repo=filename, repo_id=repo_id, repo_type=repo_type,
             commit_message=commit_message or f"Delete {filename}")
+        _cache_invalidate(repo_id, repo_type)
         return {"deleted": str(r)}
-
     if action == "validate":
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=filename, repo_type=repo_type)
-        if isinstance(local, dict): return local
-        with open(local, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
+        result = await fetch_file_http(repo_id, filename, repo_type)
+        if "error" in result: return result
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "text"
         try:
-            if ext == "json": json.loads(raw)
-            return {"valid": True, "format": ext, "size": len(raw)}
+            if ext == "json": json.loads(result["content"])
+            return {"valid": True, "format": ext, "size": result.get("size", 0)}
         except Exception as e:
             return {"valid": False, "error": str(e)}
-
     if action == "backup":
         read_only_guard()
-        local = await run_in_thread(api.hf_hub_download,
-            repo_id=repo_id, filename=filename, repo_type=repo_type)
-        if isinstance(local, dict): return local
-        with open(local, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
+        result = await fetch_file_http(repo_id, filename, repo_type, max_size=2_000_000)
+        if "error" in result: return result
         bak = f"{filename}.backup"
         r = await run_in_thread(api.upload_file,
-            path_or_fileobj=raw.encode(), path_in_repo=bak,
+            path_or_fileobj=result["content"].encode(), path_in_repo=bak,
             repo_id=repo_id, repo_type=repo_type,
             commit_message=f"Backup {filename}")
         return {"backup_created": bak, "result": str(r)}
-
     return {"error": f"Unknown action: {action}"}
 
 
@@ -621,16 +538,13 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "",
                   filter_tag: str = "", limit: int = 20) -> dict:
     """Search HF Hub. content_type: models | datasets | spaces"""
     try:
-        kw = dict(search=query or None, author=author or None, filter=filter_tag or None, limit=limit)
-        if content_type == "models":
-            items = api.list_models(**kw)
-        elif content_type == "datasets":
-            items = api.list_datasets(**kw)
-        else:
-            items = api.list_spaces(**kw)
+        kw = dict(search=query or None, author=author or None,
+                  filter=filter_tag or None, limit=limit)
+        if content_type == "models": items = api.list_models(**kw)
+        elif content_type == "datasets": items = api.list_datasets(**kw)
+        else: items = api.list_spaces(**kw)
         return {"results": [{"id": getattr(i, "id", None) or getattr(i, "modelId", None),
                              "author": getattr(i, "author", None),
-                             "downloads": getattr(i, "downloads", None),
                              "likes": getattr(i, "likes", None),
                              "tags": getattr(i, "tags", [])} for i in items]}
     except Exception as e:
@@ -638,7 +552,8 @@ def hf_search_hub(content_type: str, query: str = "", author: str = "",
 
 
 @mcp.tool()
-def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time: int = 300) -> dict:
+def hf_space_management(action: str, space_id: str, to_id: str = "",
+                        sleep_time: int = 300) -> dict:
     """Manage HF Spaces. action: runtime_info|restart|pause|set_sleep_time|duplicate"""
     if action == "runtime_info":
         r = safe_run(api.get_space_runtime, repo_id=space_id)
@@ -653,20 +568,21 @@ def hf_space_management(action: str, space_id: str, to_id: str = "", sleep_time:
             repo_id=space_id, sleep_time=sleep_time))}
     if action == "duplicate":
         read_only_guard()
-        return {"duplicated_to": to_id,
-                "result": str(safe_run(api.duplicate_space,
-                    from_id=space_id, to_id=to_id, exist_ok=True))}
+        return {"duplicated_to": to_id, "result": str(safe_run(api.duplicate_space,
+            from_id=space_id, to_id=to_id, exist_ok=True))}
     return {"error": f"Unknown action: {action}"}
 
 
 @mcp.tool()
 def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
                           title: str = "", description: str = "") -> dict:
-    """Community features. action: like|unlike|get_likes|create_discussion|get_commits|get_refs"""
+    """Community. action: like|unlike|get_likes|create_discussion|get_commits|get_refs"""
     if action == "like":
-        read_only_guard(); safe_run(api.like, repo_id=repo_id, repo_type=repo_type); return {"liked": repo_id}
+        read_only_guard(); safe_run(api.like, repo_id=repo_id, repo_type=repo_type)
+        return {"liked": repo_id}
     if action == "unlike":
-        read_only_guard(); safe_run(api.unlike, repo_id=repo_id, repo_type=repo_type); return {"unliked": repo_id}
+        read_only_guard(); safe_run(api.unlike, repo_id=repo_id, repo_type=repo_type)
+        return {"unliked": repo_id}
     if action == "get_likes":
         return {"liked_repos": [str(x) for x in (safe_run(api.list_liked_repos) or [])]}
     if action == "create_discussion":
@@ -687,7 +603,6 @@ def hf_community_features(action: str, repo_id: str = "", repo_type: str = "mode
 # ── ASGI middleware ────────────────────────────────────────────────────────────
 
 class FixHeadersMiddleware:
-    """Rewrites Host to localhost (bypasses MCP 421) and handles /health."""
     def __init__(self, app: ASGIApp, port: int = 8000):
         self.app = app
         self._localhost = f"localhost:{port}".encode()
@@ -696,7 +611,8 @@ class FixHeadersMiddleware:
         if scope["type"] == "http":
             path = scope.get("path", "")
             if path in ("/health", "/health/"):
-                await JSONResponse({"status": "ok", "version": "4.0.0"})(scope, receive, send)
+                await JSONResponse({"status": "ok", "version": "5.0.0",
+                                    "cache_entries": len(_file_cache)})(scope, receive, send)
                 return
             headers = []
             for name, value in scope.get("headers", []):
@@ -714,5 +630,5 @@ _mcp_asgi = mcp.streamable_http_app()
 app = FixHeadersMiddleware(_mcp_asgi, port=MCP_PORT)
 
 if __name__ == "__main__":
-    log.info(f"Starting HF MCP Server on {MCP_HOST}:{MCP_PORT}")
+    log.info(f"Starting HF MCP Server v5.0.0 on {MCP_HOST}:{MCP_PORT}")
     uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
