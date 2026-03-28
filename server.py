@@ -35,9 +35,7 @@ _executor = ThreadPoolExecutor(max_workers=16)
 
 _http_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 _http_client: Optional[httpx.AsyncClient] = None
-_HEALTH_BODY = _dumps({"status": "ok", "v": "5.4.0"}).encode()
-
-# Cache whoami to avoid repeated API calls
+_HEALTH_BODY = _dumps({"status": "ok", "v": "5.5.0"}).encode()
 _whoami_cache: Optional[dict] = None
 
 def _get_whoami() -> dict:
@@ -75,11 +73,13 @@ def _cset(k, repo_id, rt, v):
     _cache[k] = (time.monotonic(), v)
     if len(_cache) > 400:
         cut = time.monotonic() - HF_CACHE_TTL
-        for x in [x for x, (ts, _) in list(_cache.items()) if ts < cut]: _cache.pop(x, None)
+        for x in [x for x, (ts, _) in list(_cache.items()) if ts < cut]:
+            _cache.pop(x, None)
 
 def _cinv(repo_id, rt):
     tag = f"{rt}/{repo_id}"
-    for k in [k for k, (_, v) in list(_cache.items()) if v.get("_r") == tag]: _cache.pop(k, None)
+    for k in [k for k, (_, v) in list(_cache.items()) if v.get("_r") == tag]:
+        _cache.pop(k, None)
 
 async def _fetch(repo_id, fn, rt, max_sz=500_000):
     k = _ck(repo_id, fn, rt)
@@ -95,60 +95,86 @@ async def _fetch(repo_id, fn, rt, max_sz=500_000):
         r.raise_for_status()
         raw = r.text
         res = {"content": raw[:max_sz], "size": len(raw), "truncated": len(raw) > max_sz}
-        _cset(k, repo_id, rt, res); fut.set_result(res); return res
+        _cset(k, repo_id, rt, res)
+        fut.set_result(res)
+        return res
     except httpx.HTTPStatusError as e:
-        err = {"error": f"HTTP {e.response.status_code}"}; fut.set_exception(Exception(err["error"])); return err
+        err = {"error": f"HTTP {e.response.status_code}"}
+        fut.set_exception(Exception(err["error"]))
+        return err
     except Exception as e:
-        err = {"error": str(e)}; fut.set_exception(e); return err
-    finally: _flight.pop(k, None)
+        err = {"error": str(e)}
+        fut.set_exception(e)
+        return err
+    finally:
+        _flight.pop(k, None)
 
 async def _run(fn, *a, **kw):
     try:
         return await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(_executor, lambda: fn(*a, **kw)),
             timeout=HF_UPLOAD_TIMEOUT)
-    except asyncio.TimeoutError: return {"error": f"timeout {HF_UPLOAD_TIMEOUT}s"}
-    except Exception as e: return {"error": str(e), "type": type(e).__name__}
+    except asyncio.TimeoutError:
+        return {"error": f"timeout {HF_UPLOAD_TIMEOUT}s"}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__}
 
 def _safe(fn, *a, **kw):
     try: return fn(*a, **kw)
     except Exception as e: return {"error": str(e)}
 
-def _edits(text, edits):
+def _apply_edits(text: str, edits: list) -> tuple:
     log_e = []
     for i, e in enumerate(edits):
         m = e.get("mode", "replace")
         try:
             if m == "overwrite":
-                text = e["content"]; log_e.append({"i": i, "ok": True})
+                text = e["content"]
+                log_e.append({"i": i, "ok": True})
             elif m == "replace":
-                if e["old"] not in text: log_e.append({"i": i, "ok": False, "reason": "not_found"}); continue
-                n = text.count(e["old"]); text = text.replace(e["old"], e["new"]); log_e.append({"i": i, "ok": True, "n": n})
+                if e["old"] not in text:
+                    log_e.append({"i": i, "ok": False, "reason": "not_found"})
+                    continue
+                n = text.count(e["old"])
+                text = text.replace(e["old"], e["new"])
+                log_e.append({"i": i, "ok": True, "n": n})
             elif m == "regex":
                 fl = 0
-                for f in e.get("flags","").upper().split("|"):
-                    if f=="IGNORECASE": fl|=re.IGNORECASE
-                    elif f=="MULTILINE": fl|=re.MULTILINE
-                    elif f=="DOTALL": fl|=re.DOTALL
-                text, n = re.subn(e["pattern"], e["replacement"], text, flags=fl); log_e.append({"i": i, "ok": True, "n": n})
+                for f in e.get("flags", "").upper().split("|"):
+                    if f == "IGNORECASE": fl |= re.IGNORECASE
+                    elif f == "MULTILINE": fl |= re.MULTILINE
+                    elif f == "DOTALL":    fl |= re.DOTALL
+                text, n = re.subn(e["pattern"], e["replacement"], text, flags=fl)
+                log_e.append({"i": i, "ok": True, "n": n})
             elif m == "insert_after":
                 lines, out, found = text.splitlines(keepends=True), [], False
                 for ln in lines:
                     out.append(ln)
-                    if e["after_pattern"] in ln: ins=e["insert"]; out.append(ins if ins.endswith("\n") else ins+"\n"); found=True
-                text="".join(out); log_e.append({"i":i,"ok":found})
+                    if e["after_pattern"] in ln:
+                        ins = e["insert"]
+                        out.append(ins if ins.endswith("\n") else ins + "\n")
+                        found = True
+                text = "".join(out)
+                log_e.append({"i": i, "ok": found})
             elif m == "insert_before":
                 lines, out, found = text.splitlines(keepends=True), [], False
                 for ln in lines:
-                    if e["before_pattern"] in ln: ins=e["insert"]; out.append(ins if ins.endswith("\n") else ins+"\n"); found=True
+                    if e["before_pattern"] in ln:
+                        ins = e["insert"]
+                        out.append(ins if ins.endswith("\n") else ins + "\n")
+                        found = True
                     out.append(ln)
-                text="".join(out); log_e.append({"i":i,"ok":found})
+                text = "".join(out)
+                log_e.append({"i": i, "ok": found})
             elif m == "delete_lines":
                 old_lines = text.splitlines(keepends=True)
                 new_lines = [l for l in old_lines if e["line_pattern"] not in l]
-                text="".join(new_lines); log_e.append({"i":i,"ok":True,"deleted":len(old_lines)-len(new_lines)})
-            else: log_e.append({"i":i,"ok":False,"reason":"unknown_mode"})
-        except Exception as ex: log_e.append({"i":i,"ok":False,"reason":str(ex)})
+                text = "".join(new_lines)
+                log_e.append({"i": i, "ok": True, "deleted": len(old_lines) - len(new_lines)})
+            else:
+                log_e.append({"i": i, "ok": False, "reason": "unknown_mode"})
+        except Exception as ex:
+            log_e.append({"i": i, "ok": False, "reason": str(ex)})
     return text, log_e
 
 def _rguard():
@@ -158,16 +184,124 @@ def _aguard():
 
 mcp = FastMCP("hf-mcp", stateless_http=True, json_response=True)
 
-# ── TOOLS ─────────────────────────────────────────────────────────────────────
+# ──────────────────────── TOOLS ────────────────────────────
 
 @mcp.tool()
 def hf_whoami() -> dict:
     """
-    Returns the authenticated HF username. ALWAYS call this first when you need
-    the username to build repo_id (format: username/repo-name).
-    Never search or guess the username — just call this.
+    Returns authenticated HF username.
+    Call ONCE at start when you need username for repo_id.
+    Result: {name, type}. Cached — zero latency on repeat calls.
     """
     return _get_whoami()
+
+
+@mcp.tool()
+async def hf_list_files(repo_id: str, repo_type: str = "space") -> dict:
+    """
+    File tree for a HF repo: [{path, size, type}].
+    Call before hf_read_many to decide which files to read.
+    Skip binaries: *.png *.jpg *.woff *.ttf *.lock *.bin
+    """
+    try:
+        r = await get_http().get(
+            f"https://huggingface.co/api/{repo_type}s/{repo_id}/tree/main"
+            "?recursive=true&expand=false")
+        r.raise_for_status()
+        items = _loads(r.text)
+        tree = [{"path": it["path"], "type": it.get("type", "file"), "size": it.get("size")}
+                for it in items]
+        return {"tree": tree, "files": [x["path"] for x in tree if x["type"] == "file"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def hf_read_many(
+    repo_id: str,
+    filenames: list,
+    repo_type: str = "space",
+    max_size_per_file: int = 200_000,
+) -> dict:
+    """
+    Read multiple files IN PARALLEL. Returns {filename: {content, size, truncated}}.
+    Cached 3 min. Use after hf_list_files — pass only files relevant to the task.
+    """
+    results = await asyncio.gather(
+        *[_fetch(repo_id, f, repo_type, max_size_per_file) for f in filenames]
+    )
+    return dict(zip(filenames, results))
+
+
+@mcp.tool()
+async def hf_atomic_commit(
+    repo_id: str,
+    files: list,
+    commit_message: str,
+    repo_type: str = "space",
+    create_pr: bool = False,
+) -> dict:
+    """
+    Write/edit/delete files in ONE atomic commit. Always use this for any write.
+    ops:
+      add:    {"op":"add",  "path":"x.py",  "content":"full file content"}
+      delete: {"op":"delete","path":"x.py"}
+      rename: {"op":"rename","from":"a.py","to":"b.py"}
+      edit:   {"op":"edit",  "path":"x.py",  "edits":[...]} (see edit modes below)
+    edit modes: replace{mode,old,new} overwrite{mode,content}
+                regex{mode,pattern,replacement,flags}
+                insert_after{mode,after_pattern,insert}
+                insert_before{mode,before_pattern,insert}
+                delete_lines{mode,line_pattern}
+    All edit-op files fetched in parallel before committing.
+    """
+    _rguard()
+    edit_items = [(i, x) for i, x in enumerate(files) if x.get("op") == "edit"]
+    fetched = {}
+    if edit_items:
+        res_list = await asyncio.gather(
+            *[_fetch(repo_id, x["path"], repo_type, 2_000_000) for _, x in edit_items]
+        )
+        fetched = {x["path"]: r for (_, x), r in zip(edit_items, res_list)}
+
+    ops, elogs = [], {}
+    for item in files:
+        op = item.get("op", "add")
+        if op == "add":
+            ops.append(CommitOperationAdd(
+                path_in_repo=item["path"],
+                path_or_fileobj=item["content"].encode()))
+        elif op == "delete":
+            ops.append(CommitOperationDelete(path_in_repo=item["path"]))
+        elif op == "rename":
+            ops.append(CommitOperationCopy(
+                src_path_in_repo=item["from"], dest_path_in_repo=item["to"]))
+            ops.append(CommitOperationDelete(path_in_repo=item["from"]))
+        elif op == "copy":
+            ops.append(CommitOperationCopy(
+                src_path_in_repo=item["from"], dest_path_in_repo=item["to"]))
+        elif op == "edit":
+            fr = fetched.get(item["path"], {})
+            if "error" in fr:
+                elogs[item["path"]] = {"error": fr}
+                continue
+            text, el = _apply_edits(fr["content"], item.get("edits", []))
+            elogs[item["path"]] = el
+            ops.append(CommitOperationAdd(
+                path_in_repo=item["path"],
+                path_or_fileobj=text.encode()))
+
+    if not ops:
+        return {"error": "no valid ops", "logs": elogs}
+
+    r = await _run(api.create_commit,
+                   repo_id=repo_id, repo_type=repo_type,
+                   operations=ops, commit_message=commit_message,
+                   create_pr=create_pr)
+    _cinv(repo_id, repo_type)
+    if isinstance(r, dict):
+        return r
+    return {"status": "ok", "commit": str(r), "ops": len(ops), "logs": elogs}
 
 
 @mcp.tool()
@@ -179,47 +313,35 @@ async def hf_create_space_with_files(
     commit_message: str = "Initial upload",
 ) -> dict:
     """
-    Create a HF Space AND upload all files in ONE call. Fastest way to deploy.
-    Automatically resolves username — no need to call hf_whoami separately.
-    space_name: just the name without username, e.g. "my-portfolio"
+    Create HF Space + upload all files in ONE call. Use this for all new spaces.
+    Resolves username automatically — do NOT call hf_whoami separately.
+    space_name: name only, no username prefix. e.g. "my-portfolio"
     files: [{"path": "index.html", "content": "..."}]
     sdk: static (default) | gradio | streamlit | docker
-    Returns: {repo_id, url, files_uploaded, commit}
+    Returns: {repo_id, url, files_uploaded}
     """
     _rguard()
     whoami = _get_whoami()
     if "error" in whoami:
         return whoami
-    username = whoami["name"]
-    repo_id = f"{username}/{space_name}"
+    repo_id = f"{whoami['name']}/{space_name}"
 
-    # Step 1: create space
-    create_result = _safe(
-        api.create_repo,
-        repo_id=repo_id, repo_type="space",
-        space_sdk=sdk, private=private, exist_ok=True,
-    )
-    if isinstance(create_result, dict) and "error" in create_result:
-        return create_result
+    cr = _safe(api.create_repo, repo_id=repo_id, repo_type="space",
+               space_sdk=sdk, private=private, exist_ok=True)
+    if isinstance(cr, dict) and "error" in cr:
+        return cr
 
-    # Step 2: commit all files atomically
     if not files:
-        return {"repo_id": repo_id, "url": f"https://huggingface.co/spaces/{repo_id}",
-                "files_uploaded": 0, "warning": "no files provided"}
+        return {"repo_id": repo_id,
+                "url": f"https://huggingface.co/spaces/{repo_id}",
+                "files_uploaded": 0}
 
-    operations = [
-        CommitOperationAdd(
-            path_in_repo=f["path"],
-            path_or_fileobj=f["content"].encode(),
-        )
-        for f in files
-    ]
-    commit = await _run(
-        api.create_commit,
-        repo_id=repo_id, repo_type="space",
-        operations=operations,
-        commit_message=commit_message,
-    )
+    ops = [CommitOperationAdd(path_in_repo=f["path"],
+                              path_or_fileobj=f["content"].encode())
+           for f in files]
+    commit = await _run(api.create_commit,
+                        repo_id=repo_id, repo_type="space",
+                        operations=ops, commit_message=commit_message)
     if isinstance(commit, dict) and "error" in commit:
         return {"repo_id": repo_id, "created": True, "upload_error": commit["error"]}
 
@@ -232,209 +354,91 @@ async def hf_create_space_with_files(
 
 
 @mcp.tool()
+def hf_repository_manager(
+    action: str, repo_id: str, repo_type: str = "model",
+    private: bool = False, space_sdk: str = "",
+) -> dict:
+    """Repo ops. action: create|delete|info"""
+    if action == "info":
+        r = _safe(api.repo_info, repo_id=repo_id, repo_type=repo_type)
+        return r if isinstance(r, dict) else r.__dict__
+    if action == "create":
+        _rguard()
+        return {"created": str(_safe(api.create_repo, repo_id=repo_id, repo_type=repo_type,
+                                     private=private, space_sdk=space_sdk or None, exist_ok=True))}
+    if action == "delete":
+        _rguard(); _aguard()
+        _safe(api.delete_repo, repo_id=repo_id, repo_type=repo_type)
+        return {"deleted": repo_id}
+    return {"error": f"unknown: {action}"}
+
+
+@mcp.tool()
+def hf_space_management(
+    action: str, space_id: str, to_id: str = "", sleep_time: int = 300,
+) -> dict:
+    """Space ops. action: runtime_info|restart|pause|set_sleep_time|duplicate"""
+    if action == "runtime_info":
+        r = _safe(api.get_space_runtime, repo_id=space_id)
+        return r if isinstance(r, dict) else r.__dict__
+    if action == "restart":      _rguard(); return {"restarted": str(_safe(api.restart_space, repo_id=space_id))}
+    if action == "pause":        _rguard(); return {"paused": str(_safe(api.pause_space, repo_id=space_id))}
+    if action == "set_sleep_time": _rguard(); return {"set": str(_safe(api.set_space_sleep_time, repo_id=space_id, sleep_time=sleep_time))}
+    if action == "duplicate":    _rguard(); return {"to": to_id, "result": str(_safe(api.duplicate_space, from_id=space_id, to_id=to_id, exist_ok=True))}
+    return {"error": f"unknown: {action}"}
+
+
+@mcp.tool()
+def hf_search_hub(
+    content_type: str, query: str = "", author: str = "",
+    filter_tag: str = "", limit: int = 20,
+) -> dict:
+    """Search HF Hub. content_type: models|datasets|spaces"""
+    try:
+        kw = dict(search=query or None, author=author or None,
+                  filter=filter_tag or None, limit=limit)
+        if content_type == "models":     items = api.list_models(**kw)
+        elif content_type == "datasets": items = api.list_datasets(**kw)
+        else:                            items = api.list_spaces(**kw)
+        return {"results": [{"id": getattr(i, "id", None) or getattr(i, "modelId", None),
+                             "author": getattr(i, "author", None)} for i in items]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def hf_community_features(
+    action: str, repo_id: str = "", repo_type: str = "model",
+    title: str = "", description: str = "",
+) -> dict:
+    """Community. action: like|unlike|create_discussion|get_commits|get_refs"""
+    if action == "like":   _rguard(); _safe(api.like, repo_id=repo_id, repo_type=repo_type); return {"liked": repo_id}
+    if action == "unlike": _rguard(); _safe(api.unlike, repo_id=repo_id, repo_type=repo_type); return {"unliked": repo_id}
+    if action == "create_discussion":
+        _rguard()
+        r = _safe(api.create_discussion, repo_id=repo_id, repo_type=repo_type,
+                  title=title or "Discussion", description=description, pull_request=False)
+        return {"discussion": str(r)}
+    if action == "get_commits":
+        r = _safe(api.list_repo_commits, repo_id=repo_id, repo_type=repo_type)
+        return r if isinstance(r, dict) else {"commits": [{"id": c.commit_id, "msg": c.title} for c in list(r)[:50]]}
+    if action == "get_refs":
+        r = _safe(api.list_repo_refs, repo_id=repo_id, repo_type=repo_type)
+        return r if isinstance(r, dict) else r.__dict__
+    return {"error": f"unknown: {action}"}
+
+
+@mcp.tool()
 def hf_system_info() -> dict:
-    """Server status and cache stats."""
-    return {"v":"5.4.0","ro":HF_READ_ONLY,"admin":HF_ADMIN_MODE,
-            "token":bool(HF_TOKEN),"cache":len(_cache),"flight":len(_flight),
+    """Server status, cache stats, whoami."""
+    return {"v": "5.5.0", "ro": HF_READ_ONLY, "admin": HF_ADMIN_MODE,
+            "token": bool(HF_TOKEN), "cache": len(_cache),
             "whoami": _get_whoami()}
 
 
-@mcp.tool()
-async def hf_list_files(repo_id: str, repo_type: str = "space") -> dict:
-    """
-    Returns file tree (path, size, type) for a HF repo.
-    Call before reading/modifying. Then use hf_read_many for relevant files only.
-    Skip: *.png *.jpg *.woff *.lock node_modules __pycache__
-    """
-    try:
-        r = await get_http().get(
-            f"https://huggingface.co/api/{repo_type}s/{repo_id}/tree/main?recursive=true&expand=false")
-        r.raise_for_status()
-        items = _loads(r.text)
-        tree = [{"path":it["path"],"type":it.get("type","file"),"size":it.get("size")} for it in items]
-        return {"tree":tree,"files":[x["path"] for x in tree if x["type"]=="file"]}
-    except Exception as e: return {"error": str(e)}
-
-
-@mcp.tool()
-async def hf_read_many(repo_id: str, filenames: list, repo_type: str = "space",
-                       max_size_per_file: int = 200_000) -> dict:
-    """
-    Read multiple files in parallel. Call after hf_list_files.
-    Returns {filename: {content,size,truncated}}. Cached 3min.
-    """
-    results = await asyncio.gather(*[_fetch(repo_id, f, repo_type, max_size_per_file) for f in filenames])
-    return dict(zip(filenames, results))
-
-
-@mcp.tool()
-async def hf_smart_edit(repo_id: str, filename: str, edits: list,
-                        repo_type: str = "space", commit_message: str = "") -> dict:
-    """
-    Edit one file with surgical ops in one commit. Cache auto-cleared.
-    modes: replace|regex|insert_after|insert_before|delete_lines|overwrite
-    replace: {mode,old,new}  regex: {mode,pattern,replacement,flags}
-    """
-    _rguard()
-    res = await _fetch(repo_id, filename, repo_type, 2_000_000)
-    if "error" in res: return res
-    text, elog = _edits(res["content"], edits)
-    if text == res["content"]: return {"status":"no_changes","log":elog}
-    r = await _run(api.upload_file, path_or_fileobj=text.encode(),
-                   path_in_repo=filename, repo_id=repo_id, repo_type=repo_type,
-                   commit_message=commit_message or f"edit {filename}")
-    _cinv(repo_id, repo_type)
-    return {"status":"ok","result":str(r),"log":elog}
-
-
-@mcp.tool()
-async def hf_atomic_commit(repo_id: str, files: list, commit_message: str,
-                           repo_type: str = "space", create_pr: bool = False) -> dict:
-    """
-    Commit multiple files atomically in ONE commit. Use for all multi-file changes.
-    ops: add{op,path,content} delete{op,path} rename{op,from,to} edit{op,path,edits[]}
-    """
-    _rguard()
-    edit_items = [(i,x) for i,x in enumerate(files) if x.get("op")=="edit"]
-    fetched = {}
-    if edit_items:
-        res_list = await asyncio.gather(*[_fetch(repo_id,x["path"],repo_type,2_000_000) for _,x in edit_items])
-        fetched = {x["path"]:r for (_,x),r in zip(edit_items,res_list)}
-    ops, elogs = [], {}
-    for item in files:
-        op = item.get("op","add")
-        if op=="add": ops.append(CommitOperationAdd(path_in_repo=item["path"],path_or_fileobj=item["content"].encode()))
-        elif op=="delete": ops.append(CommitOperationDelete(path_in_repo=item["path"]))
-        elif op=="rename":
-            ops.append(CommitOperationCopy(src_path_in_repo=item["from"],dest_path_in_repo=item["to"]))
-            ops.append(CommitOperationDelete(path_in_repo=item["from"]))
-        elif op=="copy": ops.append(CommitOperationCopy(src_path_in_repo=item["from"],dest_path_in_repo=item["to"]))
-        elif op=="edit":
-            fr = fetched.get(item["path"],{})
-            if "error" in fr: elogs[item["path"]]={"error":fr}; continue
-            text, el = _edits(fr["content"], item.get("edits",[]))
-            elogs[item["path"]] = el
-            ops.append(CommitOperationAdd(path_in_repo=item["path"],path_or_fileobj=text.encode()))
-    if not ops: return {"error":"no valid ops","logs":elogs}
-    r = await _run(api.create_commit, repo_id=repo_id, repo_type=repo_type,
-                   operations=ops, commit_message=commit_message, create_pr=create_pr)
-    _cinv(repo_id, repo_type)
-    return {"status":"ok","commit":str(r),"ops":len(ops),"logs":elogs} if not isinstance(r,dict) else r
-
-
-@mcp.tool()
-def hf_repository_manager(action: str, repo_id: str, repo_type: str = "model",
-                          private: bool = False, space_sdk: str = "") -> dict:
-    """Repo CRUD. action: create|delete|info"""
-    if action=="info":
-        r=_safe(api.repo_info,repo_id=repo_id,repo_type=repo_type)
-        return r if isinstance(r,dict) else r.__dict__
-    if action=="create":
-        _rguard()
-        return {"created":str(_safe(api.create_repo,repo_id=repo_id,repo_type=repo_type,private=private,space_sdk=space_sdk or None,exist_ok=True))}
-    if action=="delete":
-        _rguard();_aguard();_safe(api.delete_repo,repo_id=repo_id,repo_type=repo_type)
-        return {"deleted":repo_id}
-    return {"error":f"unknown: {action}"}
-
-
-@mcp.tool()
-async def hf_file_operations(action: str, repo_id: str, filename: str = "",
-                             repo_type: str = "space", content: str = "",
-                             commit_message: str = "", old_text: str = "",
-                             new_text: str = "", max_size: int = 500_000) -> dict:
-    """Single-file CRUD fallback. action: read|write|edit|delete|validate|backup"""
-    if action=="read": return await _fetch(repo_id,filename,repo_type,max_size)
-    if action=="write":
-        _rguard()
-        r=await _run(api.upload_file,path_or_fileobj=content.encode(),path_in_repo=filename,
-                     repo_id=repo_id,repo_type=repo_type,commit_message=commit_message or f"upload {filename}")
-        _cinv(repo_id,repo_type); return {"uploaded":str(r)}
-    if action=="edit":
-        _rguard()
-        res=await _fetch(repo_id,filename,repo_type,2_000_000)
-        if "error" in res: return res
-        if old_text not in res["content"]: return {"error":"old_text not found"}
-        up=res["content"].replace(old_text,new_text)
-        r=await _run(api.upload_file,path_or_fileobj=up.encode(),path_in_repo=filename,
-                     repo_id=repo_id,repo_type=repo_type,commit_message=commit_message or f"edit {filename}")
-        _cinv(repo_id,repo_type); return {"edited":str(r)}
-    if action=="delete":
-        _rguard()
-        r=await _run(api.delete_file,path_in_repo=filename,repo_id=repo_id,repo_type=repo_type,
-                     commit_message=commit_message or f"delete {filename}")
-        _cinv(repo_id,repo_type); return {"deleted":str(r)}
-    if action=="validate":
-        res=await _fetch(repo_id,filename,repo_type)
-        if "error" in res: return res
-        ext=filename.rsplit(".",1)[-1].lower() if "." in filename else "text"
-        try:
-            if ext=="json": _loads(res["content"])
-            return {"valid":True,"format":ext,"size":res.get("size",0)}
-        except Exception as e: return {"valid":False,"error":str(e)}
-    if action=="backup":
-        _rguard()
-        res=await _fetch(repo_id,filename,repo_type,2_000_000)
-        if "error" in res: return res
-        r=await _run(api.upload_file,path_or_fileobj=res["content"].encode(),
-                     path_in_repo=f"{filename}.backup",repo_id=repo_id,repo_type=repo_type,
-                     commit_message=f"backup {filename}")
-        return {"backup":f"{filename}.backup","result":str(r)}
-    return {"error":f"unknown: {action}"}
-
-
-@mcp.tool()
-def hf_search_hub(content_type: str, query: str = "", author: str = "",
-                 filter_tag: str = "", limit: int = 20) -> dict:
-    """Search HF Hub. content_type: models|datasets|spaces"""
-    try:
-        kw=dict(search=query or None,author=author or None,filter=filter_tag or None,limit=limit)
-        if content_type=="models": items=api.list_models(**kw)
-        elif content_type=="datasets": items=api.list_datasets(**kw)
-        else: items=api.list_spaces(**kw)
-        return {"results":[{"id":getattr(i,"id",None) or getattr(i,"modelId",None),
-                            "author":getattr(i,"author",None),"likes":getattr(i,"likes",None)} for i in items]}
-    except Exception as e: return {"error":str(e)}
-
-
-@mcp.tool()
-def hf_space_management(action: str, space_id: str, to_id: str = "",
-                        sleep_time: int = 300) -> dict:
-    """Space ops. action: runtime_info|restart|pause|set_sleep_time|duplicate"""
-    if action=="runtime_info":
-        r=_safe(api.get_space_runtime,repo_id=space_id)
-        return r if isinstance(r,dict) else r.__dict__
-    if action=="restart": _rguard(); return {"restarted":str(_safe(api.restart_space,repo_id=space_id))}
-    if action=="pause": _rguard(); return {"paused":str(_safe(api.pause_space,repo_id=space_id))}
-    if action=="set_sleep_time": _rguard(); return {"set":str(_safe(api.set_space_sleep_time,repo_id=space_id,sleep_time=sleep_time))}
-    if action=="duplicate": _rguard(); return {"to":to_id,"result":str(_safe(api.duplicate_space,from_id=space_id,to_id=to_id,exist_ok=True))}
-    return {"error":f"unknown: {action}"}
-
-
-@mcp.tool()
-def hf_community_features(action: str, repo_id: str = "", repo_type: str = "model",
-                          title: str = "", description: str = "") -> dict:
-    """Community. action: like|unlike|get_likes|create_discussion|get_commits|get_refs"""
-    if action=="like": _rguard(); _safe(api.like,repo_id=repo_id,repo_type=repo_type); return {"liked":repo_id}
-    if action=="unlike": _rguard(); _safe(api.unlike,repo_id=repo_id,repo_type=repo_type); return {"unliked":repo_id}
-    if action=="get_likes": return {"repos":[str(x) for x in (_safe(api.list_liked_repos) or [])]}
-    if action=="create_discussion":
-        _rguard()
-        r=_safe(api.create_discussion,repo_id=repo_id,repo_type=repo_type,title=title or "Discussion",description=description,pull_request=False)
-        return {"discussion":str(r)}
-    if action=="get_commits":
-        r=_safe(api.list_repo_commits,repo_id=repo_id,repo_type=repo_type)
-        return r if isinstance(r,dict) else {"commits":[{"id":c.commit_id,"msg":c.title} for c in list(r)[:50]]}
-    if action=="get_refs":
-        r=_safe(api.list_repo_refs,repo_id=repo_id,repo_type=repo_type)
-        return r if isinstance(r,dict) else r.__dict__
-    return {"error":f"unknown: {action}"}
-
-
-# ── ASGI ──────────────────────────────────────────────────────────────────────
+# ──────────────────────── ASGI ─────────────────────────────
 
 class FastMiddleware:
-    """Health endpoint + Host/Origin header fix."""
     __slots__ = ("app", "_lh")
     def __init__(self, app: ASGIApp, port: int = 8000):
         self.app = app
@@ -452,6 +456,7 @@ class FastMiddleware:
                 for n, v in scope.get("headers", [])
             ]
         await self.app(scope, receive, send)
+
 
 app = GZipMiddleware(FastMiddleware(mcp.streamable_http_app(), port=MCP_PORT), minimum_size=400)
 
