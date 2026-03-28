@@ -14,27 +14,23 @@ services:
       MCP_PORT: ${MCP_PORT:-8000}
       HF_UPLOAD_TIMEOUT: ${HF_UPLOAD_TIMEOUT:-300}
       HF_CACHE_TTL: ${HF_CACHE_TTL:-180}
-      # Uvicorn performance
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     ports:
       - "${MCP_PORT:-8000}:8000"
     networks:
       - dokploy-network
+    # Lightweight healthcheck — just TCP, no curl overhead
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval: 20s
-      timeout: 5s
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 3s
       retries: 3
-      start_period: 15s
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
-    # Tune kernel TCP buffers for low-latency
-    sysctls:
-      net.core.somaxconn: 1024
-      net.ipv4.tcp_fin_timeout: 15
+        max-size: "5m"
+        max-file: "2"
 
 networks:
   dokploy-network:
